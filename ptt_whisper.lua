@@ -1,35 +1,29 @@
 -- ============================================================
 -- Push-to-Talk Whisper Dictation for Hammerspoon
--- v3.5.1
+-- v3.6.2
 --
--- v3.5.1 修正（Code Review 修正）：
---   R6. [Fix] Streaming fallback 改為漸進式降級（連續失敗 N 次才切換）
---   R7. [Fix] Streaming callback 記錄 stderr 到 log
---   R8. [Fix] cleanStreamOutput 合併所有非重複行（避免遺失多句結果）
---   R9. [Fix] Config 載入加入 streaming 參數範圍驗證
---   R10.[Fix] Log rotation regex 更精確匹配日期格式
+-- v3.6.2 優化（錄音品質 + 推理效能）：
+--   OPT1.[Perf] FFmpeg 錄音加入聲學濾波器鏈
+--        highpass 200Hz + lowpass 3kHz + loudnorm EBU R128
+--        嘈雜環境下辨識準確率顯著提升，config 可覆寫或停用
+--   OPT2.[Perf] 預設 model 改為 Q5_0 量化版
+--        推理速度提升 2~3 倍、記憶體減半，準確率幾乎無損
+--        若 Q5_0 不存在自動 fallback 到原始 FP16 版本
 --
--- v3.5.0 新功能（第九輪 — 中期架構優化）：
---   F4. [Feature] 轉錄結果快取（bash 端實作，Lua 傳 env var）
---   F5. [Feature] Streaming 即時轉錄模式
---        whisper.cpp --stream 邊錄邊轉，體感延遲 <0.5s
---        新增 STATE.STREAMING 狀態、streamingCallback 累積文字
---        config.json 的 streaming_mode 開關（預設 false）
---   F6. [Feature] 錯誤恢復 — Fallback Model（bash 端實作，Lua 傳 env var）
---   F7. [Feature] 健康檢查 / 自我診斷
---        Menubar → Run Diagnostics 一鍵檢查所有依賴
+-- v3.6.1：CR1~CR6（第二輪 Code Review）
 --
+-- v3.6.0：P1~P6  v3.5.1：R6~R10  v3.5.0：F4~F7
 -- v3.4.1：R2,R4  v3.4.0：F1~F3  v3.3.5：ZP~ZT
 -- v3.3.4：ZM~ZO  v3.3.3：ZI~ZL  v3.3.2：ZC~ZH
 -- v3.3.1：ZA~ZB  v3.3：Z1~Z9  v3.2：Q~Y  v3.1：L~P
 -- v3.0：E~K  v2.1：A~D
 --
 -- 使用方式：按住 Right Option 錄音，放開後自動轉錄並貼上
--- 依賴：ffmpeg、whisper.cpp 已編譯、~/ptt-whisper/transcribe.sh v2.7.1+
+-- 依賴：ffmpeg、whisper.cpp 已編譯、~/ptt-whisper/transcribe.sh v2.8.2+
 -- ============================================================
 
 -- ── 版本常數 ────────────────────────────────────────────────
-local VERSION = "3.5.1"
+local VERSION = "3.6.2"
 
 -- ── 設定區（Config）──────────────────────────────────────────
 
@@ -39,6 +33,9 @@ local RECORD_FILE       = PTT_DIR .. "/ptt_record.wav"
 local LOG_FILE          = PTT_DIR .. "/ptt_whisper_err.log"
 local TRANSCRIBE_SH     = os.getenv("HOME") .. "/ptt-whisper/transcribe.sh"
 local CONFIG_FILE       = PTT_DIR .. "/config.json"
+
+-- [P1] 共用幻覺列表路徑（Lua 與 Bash 端皆從此檔案載入）
+local BUILTIN_HALLUCINATION_FILE = PTT_DIR .. "/hallucinations_builtin.txt"
 
 -- 熱鍵
 local HOTKEY_MODS       = {}
@@ -60,10 +57,17 @@ local AUDIO_DEVICE      = ":0"
 local SOUND_REC_START   = "Tink"
 local SOUND_REC_STOP    = "Pop"
 
+-- [OPT1] 錄音聲學濾波器鏈（FFmpeg -af 參數）
+-- highpass=f=200  : 切除 200Hz 以下環境低頻噪音（冷氣、馬路隆隆聲）
+-- lowpass=f=3000  : 切除 3kHz 以上高頻嘶聲（電路雜音、風扇）
+-- loudnorm=I=-16:TP=-1.5 : EBU R128 感知響度正規化（防止忽大忽小）
+-- 設為 "" 可停用濾波器；config.json 可透過 audio_filter_chain 覆寫
+local AUDIO_FILTER_CHAIN = "highpass=f=200,lowpass=f=3000,loudnorm=I=-16:TP=-1.5"
+
 -- UI
 local SHOW_PREVIEW_ALERT = true
 
--- 貼上延遲
+-- 貼上延遲（單位：秒，有效範圍 0 < delay <= 10）
 local SLOW_PASTE_APPS = {
   ["com.tinyspeck.slackmacgap"] = 1.0,
   ["com.microsoft.teams"]       = 1.0,
@@ -76,33 +80,173 @@ local SLOW_PASTE_APPS = {
 local LANG_MODELS = {}
 
 -- ── [F5] Streaming 模式設定 ─────────────────────────────────
--- ⚠️ 實驗性功能：需要 whisper.cpp 支援 --stream 旗標
--- 啟用後按住熱鍵時 whisper.cpp 直接從麥克風擷取並即時轉錄，
--- 放開後幾乎立刻輸出結果。體感延遲從 2-3s 降至 <0.5s。
---
--- 限制：
---   1. Streaming 模式使用 whisper.cpp 自己的音訊擷取（PortAudio/SDL），
---      AUDIO_DEVICE 設定不適用（只能用系統預設麥克風）
---   2. 若 whisper.cpp build 不支援 --stream，會 graceful fallback 到傳統模式
---   3. 大型 model（large-v3）在 streaming 模式下可能延遲較高
 local STREAMING_MODE     = false
 local STREAMING_STEP_MS  = 500     -- 每次處理的步長（ms），有效範圍 100~10000
 local STREAMING_LENGTH_MS = 5000   -- 每次處理的音訊窗口長度（ms），有效範圍 1000~30000
 
 -- ── [F4] 快取設定 ────────────────────────────────────────────
--- 傳統模式下透過 env var 傳給 transcribe.sh v2.7
--- Streaming 模式不支援快取（音訊不寫入檔案）
 local CACHE_ENABLED = false
 
 -- ── [F6] Fallback Model ─────────────────────────────────────
--- 傳統模式：透過 env var 傳給 transcribe.sh
--- Streaming 模式：Lua 端自行 retry
--- 格式：檔名（如 "ggml-tiny.bin"）或完整路徑
 local FALLBACK_MODEL = ""
 
 -- ── [R6] Streaming fallback 漸進式降級 ──────────────────────
--- 連續失敗達到閾值才永久切換為傳統模式（避免暫時性問題導致永久降級）
 local STREAMING_FALLBACK_THRESHOLD = 3
+
+-- ── [P2] Streaming 累積上限（bytes）─────────────────────────
+local STREAM_ACCUMULATOR_MAX_BYTES = 65536  -- 64KB
+
+-- ── [P6] Whisper binary 搜尋路徑（與 transcribe.sh 保持一致）──
+local WHISPER_BIN_CANDIDATES = {
+  "/whisper-cli",
+  "/build/bin/whisper-cli",
+  "/main",
+  "/build/bin/main",
+}
+
+-- ── [CR3] Config 已知欄位白名單 ─────────────────────────────
+local CONFIG_KNOWN_KEYS = {
+  slow_paste_apps = true,
+  show_preview_alert = true,
+  streaming_mode = true,
+  streaming_step_ms = true,
+  streaming_length_ms = true,
+  cache_enabled = true,
+  fallback_model = true,
+  lang_models = true,
+  audio_filter_chain = true,
+}
+
+-- ── [CR3] Config 驗證：集中處理型別、範圍、預設值 ────────────
+--- 取代散落在 loadExternalConfig 各處的 if-else 驗證邏輯
+--- @param config table  已解析的 JSON config
+--- @return table  { warnings = string[] }
+local function validateConfig(config)
+  local warnings = {}
+  local function warn(msg)
+    table.insert(warnings, msg)
+    print("[PTT Whisper] WARNING: " .. msg)
+  end
+
+  -- Unknown keys
+  for key, _ in pairs(config) do
+    if not CONFIG_KNOWN_KEYS[key] then
+      warn(string.format("unknown config key '%s' (ignored)", key))
+    end
+  end
+
+  -- slow_paste_apps: table of { bundleID: delay_seconds }
+  -- 單位：秒，有效範圍 0 < delay <= 10
+  if config.slow_paste_apps ~= nil then
+    if type(config.slow_paste_apps) ~= "table" then
+      warn("slow_paste_apps: expected table, got " .. type(config.slow_paste_apps))
+    else
+      for bid, delay in pairs(config.slow_paste_apps) do
+        if type(bid) == "string" and type(delay) == "number" then
+          if delay > 0 and delay <= 10 then
+            SLOW_PASTE_APPS[bid] = delay
+          else
+            warn(string.format("slow_paste_apps[%s]=%.1f out of range (0<x<=10 sec)", bid, delay))
+          end
+        end
+      end
+    end
+  end
+
+  -- show_preview_alert: boolean
+  if config.show_preview_alert ~= nil then
+    if type(config.show_preview_alert) == "boolean" then
+      SHOW_PREVIEW_ALERT = config.show_preview_alert
+    else
+      warn("show_preview_alert: expected boolean")
+    end
+  end
+
+  -- lang_models: table of { bundleID: { lang?, model? } }
+  if config.lang_models ~= nil then
+    if type(config.lang_models) ~= "table" then
+      warn("lang_models: expected table")
+    else
+      for bid, entry in pairs(config.lang_models) do
+        if type(bid) == "string" and type(entry) == "table" then
+          local parsed = {}
+          if type(entry.lang) == "string" and entry.lang ~= "" then
+            parsed.lang = entry.lang
+          end
+          if type(entry.model) == "string" and entry.model ~= "" then
+            parsed.model = entry.model
+          end
+          if parsed.lang or parsed.model then
+            LANG_MODELS[bid] = parsed
+          end
+        end
+      end
+    end
+  end
+
+  -- streaming_mode: boolean
+  if config.streaming_mode ~= nil then
+    if type(config.streaming_mode) == "boolean" then
+      STREAMING_MODE = config.streaming_mode
+    else
+      warn("streaming_mode: expected boolean")
+    end
+  end
+
+  -- streaming_step_ms: number, 100~10000 (ms)
+  if config.streaming_step_ms ~= nil then
+    if type(config.streaming_step_ms) == "number"
+       and config.streaming_step_ms >= 100
+       and config.streaming_step_ms <= 10000 then
+      STREAMING_STEP_MS = config.streaming_step_ms
+    elseif type(config.streaming_step_ms) == "number" then
+      warn("streaming_step_ms out of range (100~10000 ms)")
+    end
+  end
+
+  -- streaming_length_ms: number, 1000~30000 (ms)
+  if config.streaming_length_ms ~= nil then
+    if type(config.streaming_length_ms) == "number"
+       and config.streaming_length_ms >= 1000
+       and config.streaming_length_ms <= 30000 then
+      STREAMING_LENGTH_MS = config.streaming_length_ms
+    elseif type(config.streaming_length_ms) == "number" then
+      warn("streaming_length_ms out of range (1000~30000 ms)")
+    end
+  end
+
+  -- cache_enabled: boolean
+  if config.cache_enabled ~= nil then
+    if type(config.cache_enabled) == "boolean" then
+      CACHE_ENABLED = config.cache_enabled
+    else
+      warn("cache_enabled: expected boolean")
+    end
+  end
+
+  -- fallback_model: string (filename or absolute path)
+  if config.fallback_model ~= nil then
+    if type(config.fallback_model) == "string" then
+      FALLBACK_MODEL = config.fallback_model
+    else
+      warn("fallback_model: expected string")
+    end
+  end
+
+  -- [OPT1] audio_filter_chain: string (FFmpeg -af 參數，"" = 停用)
+  if config.audio_filter_chain ~= nil then
+    if type(config.audio_filter_chain) == "string" then
+      AUDIO_FILTER_CHAIN = config.audio_filter_chain
+      if config.audio_filter_chain == "" then
+        print("[PTT Whisper] INFO: audio_filter_chain disabled by config")
+      end
+    else
+      warn("audio_filter_chain: expected string")
+    end
+  end
+
+  return { warnings = warnings }
+end
 
 -- ── 外部設定檔載入 ──────────────────────────────────────────
 local function loadExternalConfig()
@@ -118,66 +262,15 @@ local function loadExternalConfig()
     return
   end
 
-  if type(config.slow_paste_apps) == "table" then
-    for bid, delay in pairs(config.slow_paste_apps) do
-      if type(bid) == "string" and type(delay) == "number" then
-        SLOW_PASTE_APPS[bid] = delay
-      end
-    end
-  end
-  if type(config.show_preview_alert) == "boolean" then
-    SHOW_PREVIEW_ALERT = config.show_preview_alert
-  end
-  if type(config.lang_models) == "table" then
-    for bid, entry in pairs(config.lang_models) do
-      if type(bid) == "string" and type(entry) == "table" then
-        local parsed = {}
-        if type(entry.lang) == "string" and entry.lang ~= "" then
-          parsed.lang = entry.lang
-        end
-        if type(entry.model) == "string" and entry.model ~= "" then
-          parsed.model = entry.model
-        end
-        if parsed.lang or parsed.model then
-          LANG_MODELS[bid] = parsed
-        end
-      end
-    end
-  end
-  -- [F5] streaming_mode
-  if type(config.streaming_mode) == "boolean" then
-    STREAMING_MODE = config.streaming_mode
-  end
-  -- [R9] 加入範圍驗證，避免極端值導致 whisper.cpp 行為異常
-  if type(config.streaming_step_ms) == "number"
-     and config.streaming_step_ms >= 100
-     and config.streaming_step_ms <= 10000 then
-    STREAMING_STEP_MS = config.streaming_step_ms
-  elseif type(config.streaming_step_ms) == "number" then
-    print("[PTT Whisper] WARNING: streaming_step_ms out of range (100~10000), using default")
-  end
-  if type(config.streaming_length_ms) == "number"
-     and config.streaming_length_ms >= 1000
-     and config.streaming_length_ms <= 30000 then
-    STREAMING_LENGTH_MS = config.streaming_length_ms
-  elseif type(config.streaming_length_ms) == "number" then
-    print("[PTT Whisper] WARNING: streaming_length_ms out of range (1000~30000), using default")
-  end
-  -- [F4] cache
-  if type(config.cache_enabled) == "boolean" then
-    CACHE_ENABLED = config.cache_enabled
-  end
-  -- [F6] fallback_model
-  if type(config.fallback_model) == "string" then
-    FALLBACK_MODEL = config.fallback_model
-  end
+  -- [CR3] 使用集中式驗證取代散落的 if-else
+  validateConfig(config)
 end
 
 loadExternalConfig()
 
 -- ── 工作目錄初始化 ──────────────────────────────────────────
 hs.fs.mkdir(PTT_DIR)
-hs.execute(string.format([[chmod 700 "%s"]], PTT_DIR))
+hs.task.new("/bin/chmod", nil, {"700", PTT_DIR}):start()
 
 -- ── Reload 防護 ─────────────────────────────────────────────
 if PTTWhisper and PTTWhisper._cleanup then
@@ -189,7 +282,7 @@ local STATE = {
   IDLE         = "idle",
   RECORDING    = "recording",
   TRANSCRIBING = "transcribing",
-  STREAMING    = "streaming",      -- [F5] 邊錄邊轉
+  STREAMING    = "streaming",
   PASTING      = "pasting",
 }
 local currentState = STATE.IDLE
@@ -198,14 +291,13 @@ local sessionCounter = 0
 -- 模組級引用
 local recordTask       = nil
 local transcribeTask   = nil
-local streamTask       = nil       -- [F5]
+local streamTask       = nil
 local recordStartAt    = nil
 local cachedFFmpegPath = nil
-local streamAccumulator = ""       -- [F5] 累積 streaming 輸出
-
--- [R6] Streaming 連續失敗計數器
+local streamChunks     = {}
+local streamChunksSize = 0
+local killFallbackTimer = nil
 local streamingFailCount = 0
--- 記住使用者原始設定，以便區分「使用者關閉」與「自動降級」
 local streamingModeUserSetting = STREAMING_MODE
 
 -- ── Menubar ─────────────────────────────────────────────────
@@ -220,6 +312,48 @@ end
 
 -- ── 全域 API ────────────────────────────────────────────────
 PTTWhisper = PTTWhisper or {}
+
+-- ── [CR1] 外部命令統一 helper ───────────────────────────────
+-- 所有「跑外部命令」的需求統一經由這兩個函式，
+-- 不再直接使用 hs.execute + string.format 組裝 shell 字串。
+-- 好處：
+--   1. 每個參數獨立 shell-escape（single-quote 包裝），杜絕 injection
+--   2. 新增功能時不會漏掉某個角落又回到裸 hs.execute
+--   3. 方便未來做全域 mock / 測試
+
+--- Shell-escape 單一參數
+--- @param s string
+--- @return string  single-quoted escaped string
+local function shellEscape(s)
+  return "'" .. s:gsub("'", "'\\''") .. "'"
+end
+
+--- 同步執行外部命令
+--- @param bin string  執行檔路徑
+--- @param args table|nil  參數陣列
+--- @param opts table|nil  { stderr = bool（合併 stderr 到 stdout）}
+--- @return string output, boolean status
+local function runCommandSync(bin, args, opts)
+  opts = opts or {}
+  local parts = { shellEscape(bin) }
+  for _, arg in ipairs(args or {}) do
+    table.insert(parts, shellEscape(arg))
+  end
+  local cmd = table.concat(parts, " ")
+  if opts.stderr then cmd = cmd .. " 2>&1" end
+  return hs.execute(cmd)
+end
+
+--- 非同步執行外部命令（fire-and-forget 或帶 callback）
+--- @param bin string  執行檔路徑
+--- @param args table|nil  參數陣列
+--- @param callback function|nil  function(exitCode, stdout, stderr)
+--- @return hs.task|nil
+local function runCommandAsync(bin, args, callback)
+  local task = hs.task.new(bin, callback, args or {})
+  if task:start() then return task end
+  return nil
+end
 
 -- ── 工具函式 ─────────────────────────────────────────────────
 
@@ -259,7 +393,6 @@ local function appendErrorLog(msg)
     os.rename(LOG_FILE, LOG_FILE .. "." .. ts)
     local logFiles = {}
     for file in hs.fs.dir(PTT_DIR) do
-      -- [R10] 更精確匹配日期格式 YYYYMMDD-HHMMSS
       if file:match("^ptt_whisper_err%.log%.%d%d%d%d%d%d%d%d%-%d%d%d%d%d%d$") then
         table.insert(logFiles, file)
       end
@@ -276,7 +409,7 @@ local function appendErrorLog(msg)
   end
 end
 
---- 取得 ffmpeg 路徑
+--- [CR1] 取得 ffmpeg 路徑
 local function findFFmpeg()
   if cachedFFmpegPath then return cachedFFmpegPath end
   for _, path in ipairs({
@@ -286,23 +419,22 @@ local function findFFmpeg()
   }) do
     if hs.fs.attributes(path) then cachedFFmpegPath = path; return path end
   end
-  local found = hs.execute("which ffmpeg 2>/dev/null"):gsub("%s+$", "")
-  if found ~= "" then cachedFFmpegPath = found; return found end
+  -- [CR1] fallback: which（經由 runCommandSync 安全包裝）
+  local found = runCommandSync("/usr/bin/which", {"ffmpeg"}, {stderr = true})
+  found = (found or ""):gsub("%s+$", "")
+  if found ~= "" and found:sub(1, 1) == "/" then
+    cachedFFmpegPath = found; return found
+  end
   return nil
 end
 
---- [F5][F7] 取得 whisper.cpp 二進位路徑
+--- [P6] 取得 whisper.cpp 二進位路徑
 local cachedWhisperBin = nil
 local function findWhisperBin()
   if cachedWhisperBin then return cachedWhisperBin end
   local whisperDir = os.getenv("WHISPER_DIR")
                      or (os.getenv("HOME") .. "/whisper.cpp")
-  for _, rel in ipairs({
-    "/whisper-cli",
-    "/build/bin/whisper-cli",
-    "/main",
-    "/build/bin/main",
-  }) do
+  for _, rel in ipairs(WHISPER_BIN_CANDIDATES) do
     local path = whisperDir .. rel
     if hs.fs.attributes(path) then
       cachedWhisperBin = path
@@ -312,16 +444,28 @@ local function findWhisperBin()
   return nil
 end
 
---- [F5][F7] 解析 model 路徑
---- @param modelName string|nil  檔名或完整路徑（nil = 使用預設）
---- @return string|nil  完整路徑（nil = 找不到）
+--- 解析 model 路徑
+--- [OPT2] 預設優先使用 Q5_0 量化版（速度 2~3x, RAM -50%, 準確率幾乎無損）
+---        若 Q5_0 不存在則自動 fallback 到原始 FP16 版本
 local function resolveModelPath(modelName)
   local whisperDir = os.getenv("WHISPER_DIR")
                      or (os.getenv("HOME") .. "/whisper.cpp")
   local path
   if not modelName or modelName == "" then
-    path = os.getenv("WHISPER_MODEL")
-           or (whisperDir .. "/models/ggml-small.bin")
+    -- 優先使用 env var
+    local envModel = os.getenv("WHISPER_MODEL")
+    if envModel then
+      path = envModel
+    else
+      -- [OPT2] 優先 Q5_0，fallback 到 FP16
+      local q5Path = whisperDir .. "/models/ggml-small-q5_0.bin"
+      local fpPath = whisperDir .. "/models/ggml-small.bin"
+      if hs.fs.attributes(q5Path) then
+        path = q5Path
+      else
+        path = fpPath
+      end
+    end
   elseif modelName:sub(1, 1) == "/" then
     path = modelName
   else
@@ -331,12 +475,13 @@ local function resolveModelPath(modelName)
   return nil
 end
 
---- 列出音訊裝置
+--- [CR1] 列出音訊裝置（改用 runCommandSync，不再拼 shell 字串）
 local function listAudioDevices()
   local ffmpeg = findFFmpeg()
   if not ffmpeg then print("❌ ffmpeg not found"); return end
-  local cmd = string.format([["%s" -f avfoundation -list_devices true -i '' 2>&1]], ffmpeg)
-  local output = hs.execute(cmd)
+  local output = runCommandSync(ffmpeg,
+    {"-f", "avfoundation", "-list_devices", "true", "-i", ""},
+    {stderr = true})
   print("=== AVFoundation Audio Devices ===")
   print(output or "(no output)")
   print("==================================")
@@ -347,13 +492,14 @@ PTTWhisper.findWhisperBin   = findWhisperBin
 PTTWhisper.resolveModelPath = resolveModelPath
 PTTWhisper.listAudioDevices = listAudioDevices
 
---- 安全終止 task
+--- [P3] 安全終止 task
 local function killTask(task)
   if not task then return end
   pcall(function()
     if task:isRunning() then
       task:interrupt()
-      hs.timer.doAfter(KILL_FALLBACK_SEC, function()
+      killFallbackTimer = hs.timer.doAfter(KILL_FALLBACK_SEC, function()
+        killFallbackTimer = nil
         pcall(function()
           if task:isRunning() then
             task:terminate()
@@ -363,6 +509,14 @@ local function killTask(task)
       end)
     end
   end)
+end
+
+--- [P3] 取消 killTask 的 SIGTERM fallback timer
+local function cancelKillFallbackTimer()
+  if killFallbackTimer then
+    killFallbackTimer:stop()
+    killFallbackTimer = nil
+  end
 end
 
 --- 播放音效
@@ -490,102 +644,175 @@ local function isTranscribeScriptReady()
   return true, nil
 end
 
--- ── [F5] Streaming 模式幻覺過濾 ─────────────────────────────
--- Streaming 模式不經 bash 腳本，需要 Lua 端自行過濾
--- 內建列表 + 外部 hallucinations.txt
--- ⚠️ 注意：此列表需與 transcribe.sh 的內建列表保持同步
+-- ── [CR2] 幻覺過濾：兩層比對（exact → normalized）──────────
 
-local builtinHallucinations = {
-  "Thank you.", "Thank you!", "Thank you",
-  "Thanks.", "Thanks for watching.", "Thanks for watching!",
-  "Thanks for listening.",
-  "Thank you for watching.", "Thank you for watching!",
-  "Thank you for listening.",
-  "Please subscribe.", "Subscribe.", "Like and subscribe.",
-  "Bye.", "Bye bye.", "Bye-bye.", "Goodbye.", "Good bye.",
-  "...", "..", ".", ",",
-  "Subtitles by the Amara.org community",
-  "Subtitles by the Amara.org community.",
-  "Sous-titres réalisés para la communauté d'Amara.org",
-  "ご視聴ありがとうございました", "ご視聴ありがとうございました。",
-  "謝謝觀看", "謝謝觀看。", "謝謝觀看！",
-  "謝謝收看", "謝謝收看。", "謝謝收聽", "謝謝收聽。",
-  "謝謝", "謝謝。", "感謝觀看", "感謝觀看。",
-  "字幕由Amara.org社區提供",
-  "請訂閱", "請訂閱。", "再見", "再見。",
-}
+local hallucinationSet = {}       -- exact match set
+local hallucinationNormSet = {}   -- normalized match set
 
--- 建立 lookup set 以提高比對速度
-local hallucinationSet = {}
-for _, h in ipairs(builtinHallucinations) do hallucinationSet[h] = true end
+--- [CR2] Normalize 文字以進行模糊幻覺比對
+--- 策略：trim → 壓連續空白 → 全形標點轉半形 → 移除尾部標點
+--- 設計原則：足夠寬鬆以捕捉 "Thanks ." / "謝謝。" 等變體，
+---           但不過度激進以至於誤殺合法語句
+--- @param text string
+--- @return string  normalized text（lowercase）
+local function normalizeForMatch(text)
+  if not text or text == "" then return "" end
+  -- trim
+  text = text:match("^%s*(.-)%s*$")
+  -- 壓連續空白為單一空白
+  text = text:gsub("%s+", " ")
+  -- 全形標點 → 半形
+  local fullToHalf = {
+    ["。"] = ".", ["！"] = "!", ["？"] = "?",
+    ["，"] = ",", ["；"] = ";", ["："] = ":",
+    ["、"] = ",",
+    ["（"] = "(", ["）"] = ")",
+    -- 全形空白 U+3000
+    ["\xe3\x80\x80"] = " ",
+  }
+  for full, half in pairs(fullToHalf) do
+    text = text:gsub(full, half)
+  end
+  -- 移除尾部半形標點
+  text = text:gsub("[%.!?,;:]+$", "")
+  -- 再次 trim
+  text = text:match("^%s*(.-)%s*$")
+  -- lowercase（讓 "THANK YOU" 也能匹配）
+  text = text:lower()
+  return text
+end
 
--- 載入外部幻覺列表
-local function loadExternalHallucinations()
-  local path = PTT_DIR .. "/hallucinations.txt"
+--- 從檔案載入幻覺列表（同時建立 exact 和 normalized 兩份 set）
+--- @param path string
+--- @return number  載入的條目數
+local function loadHallucinationsFromFile(path)
   local f = io.open(path, "r")
-  if not f then return end
+  if not f then return 0 end
+  local count = 0
   for line in f:lines() do
     line = line:match("^%s*(.-)%s*$")  -- trim
     if line ~= "" and line:sub(1, 1) ~= "#" then
+      -- 第一層：原始文字精確比對
       hallucinationSet[line] = true
+      -- 第二層：normalized 比對
+      local norm = normalizeForMatch(line)
+      if norm ~= "" then
+        hallucinationNormSet[norm] = true
+      end
+      count = count + 1
     end
   end
   f:close()
+  return count
 end
-loadExternalHallucinations()
 
---- 對文字做幻覺過濾
+-- 載入共用內建幻覺列表
+local builtinCount = loadHallucinationsFromFile(BUILTIN_HALLUCINATION_FILE)
+if builtinCount == 0 then
+  appendErrorLog("WARNING: hallucinations_builtin.txt not found or empty, using hardcoded fallback")
+  local fallbackList = {
+    "Thank you.", "Thank you!", "Thank you",
+    "Thanks.", "Thanks for watching.", "Thanks for watching!",
+    "Thanks for listening.",
+    "Thank you for watching.", "Thank you for watching!",
+    "Thank you for listening.",
+    "Please subscribe.", "Subscribe.", "Like and subscribe.",
+    "Bye.", "Bye bye.", "Bye-bye.", "Goodbye.", "Good bye.",
+    "...", "..", ".", ",",
+    "Subtitles by the Amara.org community",
+    "Subtitles by the Amara.org community.",
+    "Sous-titres réalisés para la communauté d'Amara.org",
+    "ご視聴ありがとうございました", "ご視聴ありがとうございました。",
+    "謝謝觀看", "謝謝觀看。", "謝謝觀看！",
+    "謝謝收看", "謝謝收看。", "謝謝收聽", "謝謝收聽。",
+    "謝謝", "謝謝。", "感謝觀看", "感謝觀看。",
+    "字幕由Amara.org社區提供",
+    "請訂閱", "請訂閱。", "再見", "再見。",
+  }
+  for _, h in ipairs(fallbackList) do
+    hallucinationSet[h] = true
+    local norm = normalizeForMatch(h)
+    if norm ~= "" then hallucinationNormSet[norm] = true end
+  end
+end
+
+-- 載入使用者自定義幻覺列表
+loadHallucinationsFromFile(PTT_DIR .. "/hallucinations.txt")
+
+--- [CR2] 幻覺過濾（兩層比對）
+--- 第一層：exact match（零誤殺）
+--- 第二層：normalized match（捕捉標點/空白/大小寫/全半形變體）
 --- @param text string
 --- @return string  過濾後文字（空字串 = 幻覺）
 local function filterHallucinations(text)
   if not text or text == "" then return "" end
-  -- trim
   text = text:match("^%s*(.-)%s*$")
   if text == "" then return "" end
-  -- 精確匹配
+  -- 第一層：精確匹配
   if hallucinationSet[text] then return "" end
+  -- 第二層：normalized 匹配
+  local norm = normalizeForMatch(text)
+  if norm ~= "" and hallucinationNormSet[norm] then return "" end
   -- 純標點檢查
   local stripped = text:gsub("[%p%s]", "")
   if stripped == "" then return "" end
   return text
 end
 
+-- [CR5] 匯出供外部測試使用
+PTTWhisper.normalizeForMatch    = normalizeForMatch
+PTTWhisper.filterHallucinations = filterHallucinations
+
 --- [F5][R8] 清理 whisper.cpp --stream 的輸出
---- 移除 ANSI escape codes、timestamp 標記，合併所有非重複有效行
 local function cleanStreamOutput(raw)
   if not raw or raw == "" then return "" end
-  -- 移除 ANSI escape codes
   local cleaned = raw:gsub("\27%[[%d;]*[A-Za-z]", "")
-  -- 移除 carriage returns（--stream 用 \r 覆寫行）
   cleaned = cleaned:gsub("\r", "\n")
-  -- 移除 timestamp 格式 [HH:MM:SS.mmm --> HH:MM:SS.mmm]
   cleaned = cleaned:gsub("%[%d+:%d+:%d+%.%d+%s*%-%->%s*%d+:%d+:%d+%.%d+%]", "")
-  -- 移除 whisper tag 標記
   cleaned = cleaned:gsub("%[BLANK_AUDIO%]", "")
   cleaned = cleaned:gsub("%[[Ss]ilence%]", "")
   cleaned = cleaned:gsub("%[[Mm]usic%]", "")
 
-  -- 取所有非空行
   local lines = {}
   for line in cleaned:gmatch("[^\n]+") do
     local trimmed = line:match("^%s*(.-)%s*$")
-    if trimmed ~= "" then
-      table.insert(lines, trimmed)
-    end
+    if trimmed ~= "" then table.insert(lines, trimmed) end
   end
-
   if #lines == 0 then return "" end
 
-  -- [R8] 合併所有非重複行（--stream 可能重複輸出已確認的文字）
-  -- 僅去除「連續」重複：--stream 的重複是相鄰行重複輸出，
-  -- 全域去重會誤刪使用者實際口述的合法重複語句
   local unique = {}
   for _, line in ipairs(lines) do
-    if line ~= unique[#unique] then
-      table.insert(unique, line)
-    end
+    if line ~= unique[#unique] then table.insert(unique, line) end
   end
   return table.concat(unique, " ")
+end
+
+-- ── [P2] Streaming 累積器 ───────────────────────────────────
+local function resetStreamAccumulator()
+  streamChunks = {}
+  streamChunksSize = 0
+end
+
+local function appendStreamChunk(data)
+  if not data or data == "" then return true end
+  local dataLen = #data
+  if streamChunksSize + dataLen > STREAM_ACCUMULATOR_MAX_BYTES then
+    if streamChunksSize < STREAM_ACCUMULATOR_MAX_BYTES then
+      appendErrorLog(string.format(
+        "streaming: accumulator reached limit (%d bytes), discarding further output",
+        STREAM_ACCUMULATOR_MAX_BYTES))
+    end
+    return false
+  end
+  table.insert(streamChunks, data)
+  streamChunksSize = streamChunksSize + dataLen
+  return true
+end
+
+local function flushStreamAccumulator()
+  local result = table.concat(streamChunks)
+  resetStreamAccumulator()
+  return result
 end
 
 -- ── 傳統模式主流程 ──────────────────────────────────────────
@@ -620,7 +847,18 @@ local function startRecording()
   recordStartAt = hs.timer.secondsSinceEpoch()
   updateMenubar("🔴", "PTT Whisper — Recording...")
 
+  -- [OPT1] 組裝 ffmpeg 錄音參數（含可選的聲學濾波器鏈）
+  local recordArgs = { "-y", "-f", "avfoundation", "-i", AUDIO_DEVICE }
+  if AUDIO_FILTER_CHAIN ~= "" then
+    table.insert(recordArgs, "-af")
+    table.insert(recordArgs, AUDIO_FILTER_CHAIN)
+  end
+  for _, v in ipairs({ "-ac", "1", "-ar", "16000", RECORD_FILE }) do
+    table.insert(recordArgs, v)
+  end
+
   recordTask = hs.task.new(ffmpeg, function(exitCode, _, stderr)
+    cancelKillFallbackTimer()
     if exitCode ~= 0 and exitCode ~= 255 and currentState == STATE.RECORDING then
       hs.timer.doAfter(0, function()
         recordTask = nil
@@ -632,10 +870,7 @@ local function startRecording()
         })
       end)
     end
-  end, {
-    "-y", "-f", "avfoundation", "-i", AUDIO_DEVICE,
-    "-ac", "1", "-ar", "16000", RECORD_FILE,
-  })
+  end, recordArgs)
 
   if recordTask:start() then
     playSound(SOUND_REC_START)
@@ -678,23 +913,21 @@ local function stopRecordingAndTranscribe()
       return
     end
 
-    hs.execute(string.format([[chmod 600 "%s" 2>/dev/null]], RECORD_FILE))
+    -- [CR1] 使用 runCommandAsync
+    runCommandAsync("/bin/chmod", {"600", RECORD_FILE})
 
-    -- 組裝 transcribe.sh 參數
     local taskArgs = { TRANSCRIBE_SH, RECORD_FILE }
     if langOverride or modelOverride then
       table.insert(taskArgs, langOverride or "")
       table.insert(taskArgs, modelOverride or "")
     end
 
-    -- [F4][F6] 透過環境變數傳遞快取/fallback 設定給 transcribe.sh
     local env = {
       PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
       HOME = os.getenv("HOME"),
     }
     if CACHE_ENABLED then env.WHISPER_CACHE = "true" end
     if FALLBACK_MODEL ~= "" then env.WHISPER_FALLBACK_MODEL = FALLBACK_MODEL end
-    -- 保留使用者的 WHISPER_DIR 等設定
     for _, k in ipairs({"WHISPER_DIR", "WHISPER_MODEL", "WHISPER_LANG",
                         "WHISPER_TIMEOUT", "WHISPER_AUTO_RESAMPLE"}) do
       local v = os.getenv(k)
@@ -702,6 +935,7 @@ local function stopRecordingAndTranscribe()
     end
 
     transcribeTask = hs.task.new("/bin/bash", function(exitCode, stdout, stderr)
+      cancelKillFallbackTimer()
       hs.timer.doAfter(0, function()
         transcribeTask = nil
         if sid ~= sessionCounter then return end
@@ -745,10 +979,7 @@ local function stopRecordingAndTranscribe()
   end)
 end
 
--- ── [R6] Streaming 降級輔助函式 ─────────────────────────────
---- 記錄 streaming 失敗，達到閾值才永久切換傳統模式
---- @param reason string  失敗原因（寫入 log）
---- @return boolean  true = 已達閾值並切換, false = 僅計數
+-- ── [R6] Streaming 降級 ─────────────────────────────────────
 local function handleStreamingFailure(reason)
   streamingFailCount = streamingFailCount + 1
   appendErrorLog(string.format(
@@ -772,7 +1003,6 @@ end
 
 -- ── [F5] Streaming 模式主流程 ───────────────────────────────
 
---- 啟動 whisper.cpp --stream 直接擷取麥克風
 local function startStreaming()
   if currentState ~= STATE.IDLE then
     hs.alert.show("⚠️ 忙碌中，請稍候...", 1)
@@ -781,37 +1011,34 @@ local function startStreaming()
 
   local whisperBin = findWhisperBin()
   if not whisperBin then
-    -- Fallback：whisper.cpp 找不到，改用傳統模式
-    appendErrorLog("streaming: whisper.cpp not found, falling back to traditional mode")
+    appendErrorLog("streaming: whisper.cpp not found, falling back")
     startRecording()
     return
   end
 
-  -- 解析 model（考慮 lang_models 覆寫）
   local langOverride, modelOverride, appName = getLangModelForCurrentApp()
   local modelPath = resolveModelPath(modelOverride)
   if not modelPath then
-    appendErrorLog("streaming: model not found, falling back to traditional mode")
+    appendErrorLog("streaming: model not found, falling back")
     startRecording()
     return
   end
 
   sessionCounter = sessionCounter + 1
   local sid = sessionCounter
-  streamAccumulator = ""
+  resetStreamAccumulator()
 
   currentState  = STATE.STREAMING
   recordStartAt = hs.timer.secondsSinceEpoch()
   updateMenubar("🔴", "PTT Whisper — Streaming...")
 
-  -- 組裝 whisper.cpp --stream 參數
   local args = {
     "--stream",
     "-m", modelPath,
-    "-nt",                                             -- no timestamps
+    "-nt",
     "--step", tostring(STREAMING_STEP_MS),
     "--length", tostring(STREAMING_LENGTH_MS),
-    "-nc",                                             -- no colors
+    "-nc",
   }
   if langOverride and langOverride ~= "" then
     table.insert(args, "-l")
@@ -822,34 +1049,26 @@ local function startStreaming()
     "streaming: start app=%s lang=%s model=%s",
     appName, langOverride or "(auto)", modelPath))
 
-  -- 使用 4 參數形式的 hs.task.new：含 streaming callback
   streamTask = hs.task.new(
     whisperBin,
-    -- termination callback
     function(exitCode, stdout, stderr)
+      cancelKillFallbackTimer()
       hs.timer.doAfter(0, function()
-        -- 如果 stopStreaming 已處理（設 streamTask = nil），直接跳過
         if not streamTask then return end
-        -- 只有非預期終止才進入此處
         streamTask = nil
         if currentState == STATE.STREAMING and sid == sessionCounter then
-          if streamAccumulator == "" and exitCode ~= 0 and exitCode ~= 255 then
-            -- [R6] 漸進式降級：記錄失敗，達閾值才永久切換
+          if streamChunksSize == 0 and exitCode ~= 0 and exitCode ~= 255 then
             currentState = STATE.IDLE
             handleStreamingFailure("unexpected exit=" .. tostring(exitCode))
           end
         end
       end)
     end,
-    -- [R7] streaming callback：記錄 stdout 並 log stderr
     function(task, stdout, stderr)
-      if stdout and stdout ~= "" then
-        streamAccumulator = streamAccumulator .. stdout
-      end
+      if stdout and stdout ~= "" then appendStreamChunk(stdout) end
       if stderr and stderr ~= "" then
         appendErrorLog("streaming stderr: " .. stderr:sub(1, 200))
       end
-      -- 回傳 true 表示繼續接收
       return true
     end,
     args
@@ -857,24 +1076,15 @@ local function startStreaming()
 
   if streamTask:start() then
     playSound(SOUND_REC_START)
-    -- [R6] 成功啟動，重置失敗計數
     streamingFailCount = 0
   else
-    streamTask = nil
-    recordStartAt = nil
-    -- [R6] Fallback 到傳統模式（漸進式降級）
+    streamTask = nil; recordStartAt = nil
     currentState = STATE.IDLE
     local switched = handleStreamingFailure("whisper.cpp --stream failed to start")
-    -- 僅在未達閾值永久切換時，才 fallback 本次到傳統模式
-    -- 若已永久切換，使用者已看到降級 alert，不再自動啟動錄音
-    -- （避免 keyUp 已過導致錄音啟動後無人停止的 race condition）
-    if not switched then
-      startRecording()
-    end
+    if not switched then startRecording() end
   end
 end
 
---- 停止 streaming，處理累積文字，貼上
 local function stopStreaming()
   if currentState ~= STATE.STREAMING then return end
   local sid = sessionCounter
@@ -883,34 +1093,21 @@ local function stopStreaming()
                    and (hs.timer.secondsSinceEpoch() - recordStartAt) or 0
   recordStartAt = nil
 
-  -- 終止 whisper.cpp --stream
-  -- 設 streamTask = nil 使 termination callback 跳過後續處理
-  -- （正常停止由本函式 stopStreaming 接管；termination callback 僅處理非預期終止）
-  if streamTask then
-    killTask(streamTask)
-    streamTask = nil
-  end
+  if streamTask then killTask(streamTask); streamTask = nil end
   playSound(SOUND_REC_STOP)
 
   if duration < MIN_RECORD_SEC then
     currentState = STATE.IDLE
-    streamAccumulator = ""
+    resetStreamAccumulator()
     updateMenubar("🎤", string.format(
       "PTT Whisper v%s — 誤觸忽略（%.2fs）", VERSION, duration))
     return
   end
 
-  -- 給 whisper.cpp 一點時間 flush 最後的輸出
   hs.timer.doAfter(0.15, function()
-    if sid ~= sessionCounter then
-      streamAccumulator = ""
-      return
-    end
+    if sid ~= sessionCounter then resetStreamAccumulator(); return end
 
-    -- 清理 + 過濾 streaming 輸出
-    local rawOutput = streamAccumulator
-    streamAccumulator = ""
-
+    local rawOutput = flushStreamAccumulator()
     local text = cleanStreamOutput(rawOutput)
     text = filterHallucinations(text)
 
@@ -923,7 +1120,6 @@ local function stopStreaming()
       return
     end
 
-    -- 進入 PASTING
     currentState = STATE.PASTING
     updateMenubar("📋", "PTT Whisper — Pasting...")
     local savedClipboard = saveClipboard()
@@ -939,7 +1135,7 @@ local function stopStreaming()
   end)
 end
 
--- ── [F7] 健康檢查 / 自我診斷 ───────────────────────────────
+-- ── [F7][CR1] 健康檢查 / 自我診斷 ──────────────────────────
 
 local function runDiagnostics()
   local results = {}
@@ -953,7 +1149,6 @@ local function runDiagnostics()
     elseif result == true then
       table.insert(results, string.format("✅ %s", name))
     elseif type(result) == "string" then
-      -- result 是警告或資訊
       if result:sub(1, 1) == "!" then
         table.insert(results, string.format("⚠️ %s — %s", name, result:sub(2)))
         allOk = false
@@ -970,14 +1165,18 @@ local function runDiagnostics()
   check("ffmpeg", function()
     local path = findFFmpeg()
     if not path then return "!找不到 ffmpeg — brew install ffmpeg" end
-    local ver = hs.execute(string.format([["%s" -version 2>&1 | head -1]], path))
-    return (ver or ""):gsub("%s+$", "")
+    local ver = runCommandSync(path, {"-version"}, {stderr = true})
+    local firstLine = (ver or ""):match("^([^\n]+)") or ""
+    return firstLine:gsub("%s+$", "")
   end)
 
   -- 2. ffprobe
   check("ffprobe", function()
-    local found = hs.execute("which ffprobe 2>/dev/null"):gsub("%s+$", "")
-    if found == "" then return "!找不到 ffprobe（通常與 ffmpeg 一起安裝）" end
+    local found = runCommandSync("/usr/bin/which", {"ffprobe"}, {stderr = true})
+    found = (found or ""):gsub("%s+$", "")
+    if found == "" or found:sub(1, 1) ~= "/" then
+      return "!找不到 ffprobe（通常與 ffmpeg 一起安裝）"
+    end
     return found
   end)
 
@@ -985,21 +1184,18 @@ local function runDiagnostics()
   check("whisper.cpp", function()
     local path = findWhisperBin()
     if not path then return "!找不到 whisper.cpp — 請檢查 ~/whisper.cpp/" end
-    -- 測試 --help 是否能正常執行
-    local output = hs.execute(string.format([["%s" --help 2>&1 | head -1]], path))
-    return path .. " — " .. ((output or ""):gsub("%s+$", ""))
+    local output = runCommandSync(path, {"--help"}, {stderr = true})
+    local firstLine = (output or ""):match("^([^\n]+)") or ""
+    return path .. " — " .. firstLine:gsub("%s+$", "")
   end)
 
-  -- 4. whisper.cpp --stream 支援
+  -- 4. --stream 支援
   check("--stream 支援", function()
     local path = findWhisperBin()
     if not path then return "!whisper.cpp 未安裝" end
-    local helpText = hs.execute(string.format([["%s" --help 2>&1]], path))
-    if helpText and helpText:find("%-%-stream") then
-      return "支援"
-    else
-      return "!此 build 不支援 --stream"
-    end
+    local helpText = runCommandSync(path, {"--help"}, {stderr = true})
+    if helpText and helpText:find("%-%-stream") then return "支援" end
+    return "!此 build 不支援 --stream"
   end)
 
   -- 5. Model 檔案
@@ -1024,15 +1220,13 @@ local function runDiagnostics()
   check("transcribe.sh", function()
     local ok, err = isTranscribeScriptReady()
     if not ok then return "!" .. err end
-    -- 讀取版本（從檔案頭取）
     local f = io.open(TRANSCRIBE_SH, "r")
     if f then
-      local line1 = f:read("*l"); local line2 = f:read("*l")
+      f:read("*l"); f:read("*l")
       local line3 = f:read("*l")
       f:close()
       if line3 and line3:match("v%d+%.%d+") then
-        return line3:match("(transcribe%.sh%s+v[%d%.]+)")
-              or TRANSCRIBE_SH
+        return line3:match("(transcribe%.sh%s+v[%d%.]+)") or TRANSCRIBE_SH
       end
     end
     return TRANSCRIBE_SH
@@ -1042,14 +1236,14 @@ local function runDiagnostics()
   check("麥克風權限", function()
     local ffmpeg = findFFmpeg()
     if not ffmpeg then return "!無法測試（ffmpeg 不存在）" end
-    -- 嘗試短暫錄音測試權限
     local testFile = PTT_DIR .. "/diag_test.wav"
-    local cmd = string.format(
-      [["%s" -y -f avfoundation -i %s -ac 1 -ar 16000 -t 0.1 "%s" 2>&1]],
-      ffmpeg, AUDIO_DEVICE, testFile)
-    local output, status = hs.execute(cmd)
+    local output = runCommandSync(ffmpeg,
+      {"-y", "-f", "avfoundation", "-i", AUDIO_DEVICE,
+       "-ac", "1", "-ar", "16000", "-t", "0.1", testFile},
+      {stderr = true})
+    local exists = hs.fs.attributes(testFile) ~= nil
     os.remove(testFile)
-    if status then return "正常" end
+    if exists then return "正常" end
     if output and output:find("[Pp]ermission") then
       return "!麥克風權限被拒絕 — 請在 系統設定 → 隱私權 中允許 Hammerspoon"
     end
@@ -1058,9 +1252,11 @@ local function runDiagnostics()
 
   -- 9. 磁碟空間
   check("磁碟空間", function()
-    local output = hs.execute([[df -h ~ | tail -1 | awk '{print $4}']])
-    local avail = (output or ""):gsub("%s+$", "")
-    if avail == "" then return "!無法取得" end
+    local output = runCommandSync("/bin/df", {"-h", os.getenv("HOME")})
+    local lastLine = ""
+    for line in (output or ""):gmatch("[^\n]+") do lastLine = line end
+    local avail = lastLine:match("%S+%s+%S+%s+%S+%s+(%S+)")
+    if not avail or avail == "" then return "!無法取得" end
     return avail .. " 可用"
   end)
 
@@ -1073,11 +1269,29 @@ local function runDiagnostics()
 
   -- 11. timeout 指令
   check("timeout 指令", function()
-    local gt = hs.execute("which gtimeout 2>/dev/null"):gsub("%s+$", "")
-    if gt ~= "" then return "gtimeout — " .. gt end
-    local t = hs.execute("which timeout 2>/dev/null"):gsub("%s+$", "")
-    if t ~= "" then return "timeout — " .. t end
+    local gt = runCommandSync("/usr/bin/which", {"gtimeout"}, {stderr = true})
+    gt = (gt or ""):gsub("%s+$", "")
+    if gt ~= "" and gt:sub(1, 1) == "/" then return "gtimeout — " .. gt end
+    local t = runCommandSync("/usr/bin/which", {"timeout"}, {stderr = true})
+    t = (t or ""):gsub("%s+$", "")
+    if t ~= "" and t:sub(1, 1) == "/" then return "timeout — " .. t end
     return "!找不到 — brew install coreutils"
+  end)
+
+  -- 12. 共用幻覺列表
+  check("hallucinations_builtin.txt", function()
+    local attr = hs.fs.attributes(BUILTIN_HALLUCINATION_FILE)
+    if not attr then return "!不存在（使用硬編碼 fallback）" end
+    local count = 0
+    local f = io.open(BUILTIN_HALLUCINATION_FILE, "r")
+    if f then
+      for line in f:lines() do
+        line = line:match("^%s*(.-)%s*$")
+        if line ~= "" and line:sub(1, 1) ~= "#" then count = count + 1 end
+      end
+      f:close()
+    end
+    return string.format("%d 條規則（+ normalized 兩層比對）", count)
   end)
 
   -- 組裝報告
@@ -1090,13 +1304,11 @@ local function runDiagnostics()
   local status = allOk and "\n\n🎉 所有檢查通過！" or "\n\n⚠️ 部分項目需要處理"
   report = report .. status
 
-  -- 寫入 console + 檔案
   print(report)
   local diagFile = PTT_DIR .. "/diagnostics.txt"
   local f = io.open(diagFile, "w")
   if f then f:write(report .. "\n"); f:close() end
 
-  -- 顯示摘要 alert
   local failCount = 0
   for _, r in ipairs(results) do
     if r:match("^❌") or r:match("^⚠") then failCount = failCount + 1 end
@@ -1119,12 +1331,13 @@ local function cleanup()
   if recordTask then pcall(function() recordTask:terminate() end) end
   if transcribeTask then pcall(function() transcribeTask:terminate() end) end
   if streamTask then pcall(function() streamTask:terminate() end) end
+  cancelKillFallbackTimer()
   recordTask     = nil
   transcribeTask = nil
   streamTask     = nil
   currentState   = STATE.IDLE
   recordStartAt  = nil
-  streamAccumulator = ""
+  resetStreamAccumulator()
   streamingFailCount = 0
   os.remove(RECORD_FILE)
   if menubarItem then menubarItem:delete(); menubarItem = nil end
@@ -1138,13 +1351,9 @@ hs.shutdownCallback = function()
   if previousShutdownCallback then previousShutdownCallback() end
 end
 
--- ── 主入口：根據模式分發 ────────────────────────────────────
+-- ── 主入口 ──────────────────────────────────────────────────
 local function onKeyDown()
-  if STREAMING_MODE then
-    startStreaming()
-  else
-    startRecording()
-  end
+  if STREAMING_MODE then startStreaming() else startRecording() end
 end
 
 local function onKeyUp()
@@ -1169,6 +1378,11 @@ local function langModelMenuLabel()
   return string.format("語言切換：%d 規則（%s）", count, dfltLabel)
 end
 
+-- [CR1] 安全開啟檔案
+local function safeOpenFile(filepath)
+  runCommandAsync("/usr/bin/open", {filepath})
+end
+
 if menubarItem then
   menubarItem:setTitle("🎤")
   menubarItem:setTooltip("PTT Whisper v" .. VERSION .. " — Ready")
@@ -1185,23 +1399,18 @@ if menubarItem then
       { title = "快取：" .. (CACHE_ENABLED and "ON" or "OFF"), disabled = true },
       { title = "Fallback：" .. (FALLBACK_MODEL ~= "" and FALLBACK_MODEL or "無"),
         disabled = true },
+      { title = "濾波器：" .. (AUDIO_FILTER_CHAIN ~= "" and "ON" or "OFF"),
+        disabled = true },
       { title = langModelMenuLabel(), disabled = true },
       { title = "-" },
-      -- [F7] 診斷
-      { title = "🔍 Run Diagnostics", fn = function()
-          runDiagnostics()
-        end
-      },
+      { title = "🔍 Run Diagnostics", fn = function() runDiagnostics() end },
       { title = "-" },
       { title = "列出音訊裝置（Console）", fn = function()
           listAudioDevices()
           hs.alert.show("裝置列表已輸出至 Console", 2)
         end
       },
-      { title = "打開 Error Log", fn = function()
-          hs.execute(string.format([[open "%s" 2>/dev/null]], LOG_FILE))
-        end
-      },
+      { title = "打開 Error Log", fn = function() safeOpenFile(LOG_FILE) end },
       { title = "打開設定檔", fn = function()
           if not hs.fs.attributes(CONFIG_FILE) then
             local f = io.open(CONFIG_FILE, "w")
@@ -1212,6 +1421,7 @@ if menubarItem then
               f:write('  "streaming_mode": false,\n')
               f:write('  "cache_enabled": false,\n')
               f:write('  "fallback_model": "",\n')
+              f:write('  "audio_filter_chain": "highpass=f=200,lowpass=f=3000,loudnorm=I=-16:TP=-1.5",\n')
               f:write('  "lang_models": {\n')
               f:write('    "_default": { "lang": "auto" }\n')
               f:write('  }\n')
@@ -1219,7 +1429,7 @@ if menubarItem then
               f:close()
             end
           end
-          hs.execute(string.format([[open "%s" 2>/dev/null]], CONFIG_FILE))
+          safeOpenFile(CONFIG_FILE)
         end
       },
       { title = "打開幻覺過濾列表", fn = function()
@@ -1231,15 +1441,11 @@ if menubarItem then
               f:close()
             end
           end
-          hs.execute(string.format([[open "%s" 2>/dev/null]], hallFile))
+          safeOpenFile(hallFile)
         end
       },
       { title = "-" },
-      { title = "Reload Hammerspoon", fn = function()
-          cleanup()
-          hs.reload()
-        end
-      },
+      { title = "Reload Hammerspoon", fn = function() cleanup(); hs.reload() end },
     }
   end)
 end

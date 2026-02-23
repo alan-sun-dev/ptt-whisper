@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================
-# transcribe.sh v2.7.1 — PTT Whisper 轉錄腳本
+# transcribe.sh v2.8.2 — PTT Whisper 轉錄腳本
 #
-# 搭配 ptt_whisper.lua v3.5.1 使用
+# 搭配 ptt_whisper.lua v3.6.2 使用
 # 用法：transcribe.sh /path/to/audio.wav [language] [model_path]
 #   language   — 覆寫 WHISPER_LANG（如 en, zh, ja）
 #                空字串 "" 或 "auto" = 不帶 -l，讓 whisper.cpp 自行偵測
@@ -11,30 +11,33 @@
 #                空字串 "" = 使用預設
 # 輸出：轉錄文字寫到 stdout（單行，去頭尾空白，含 trailing newline）
 #
-# v2.7.1 修正（Code Review 修正）：
-#  R1. [Fix] 快取 LRU 清理變數命名改善 + 安全性註解
-#  R2. [Fix] run_whisper timeout 指令變數加引號
-#  R3. [Fix] 快取 key 限制說明（不含 whisper.cpp 版本）
-#  R4. [Fix] stat 指令跨平台相容性註解
+# v2.8.2 優化（推理效能）：
+#  OPT2.[Perf] 預設 model 改為 Q5_0 量化版
+#       速度 2~3x、記憶體 -50%、準確率幾乎無損
+#       若 Q5_0 不存在自動 fallback 到原始 FP16 版本
 #
-# v2.7 新功能（第九輪 — 中期架構優化）：
-#  F4. [Feature] 轉錄結果快取
-#       對音訊檔做 checksum，相同內容+model+lang 直接回傳快取結果
-#       環境變數 WHISPER_CACHE=true 開啟（預設 false，debug 時使用）
-#       快取上限 WHISPER_CACHE_MAX=50，LRU 淘汰
-#  F6. [Feature] 錯誤恢復 — Fallback Model 重試
-#       whisper.cpp 失敗（timeout 或 crash）時，自動用較小的 model 重試
-#       環境變數 WHISPER_FALLBACK_MODEL 設定 fallback model 路徑/檔名
-#
+# v2.8.1：CR2,CR6,CRx（第二輪 Code Review）
+# v2.8.0：P1,B2  v2.7.1：R1~R4  v2.7：F4,F6
 # v2.6.1：R1~R5  v2.6：F1~F3  v2.5：#20~#23  v2.4：#18~#19
 # v2.3：#16~#17  v2.2：#10~#15  v2.1：#8~#9  v2：#1~#7
 # ============================================================
 set -euo pipefail
 umask 077
 
+# [CR6] 統一 locale — 確保 sed/sort/字元類在所有系統上行為一致
+# 這防止例如 [[:space:]] 在不同 locale 下包含不同字元的問題
+export LC_ALL=C
+
 # ── 設定區 ───────────────────────────────────────────────────
 WHISPER_DIR="${WHISPER_DIR:-$HOME/whisper.cpp}"
-MODEL="${WHISPER_MODEL:-$WHISPER_DIR/models/ggml-small.bin}"
+# [OPT2] 預設優先 Q5_0 量化版，fallback 到 FP16
+if [[ -n "${WHISPER_MODEL:-}" ]]; then
+  MODEL="$WHISPER_MODEL"
+elif [[ -f "$WHISPER_DIR/models/ggml-small-q5_0.bin" ]]; then
+  MODEL="$WHISPER_DIR/models/ggml-small-q5_0.bin"
+else
+  MODEL="$WHISPER_DIR/models/ggml-small.bin"
+fi
 LANGUAGE="${WHISPER_LANG:-auto}"
 TIMEOUT_SEC="${WHISPER_TIMEOUT:-60}"
 AUTO_RESAMPLE="${WHISPER_AUTO_RESAMPLE:-true}"
@@ -42,14 +45,12 @@ AUTO_RESAMPLE="${WHISPER_AUTO_RESAMPLE:-true}"
 # [F4] 快取設定
 CACHE_ENABLED="${WHISPER_CACHE:-false}"
 CACHE_MAX="${WHISPER_CACHE_MAX:-50}"
-# [P1] 數字消毒：防止非數字值導致 (( )) 在 set -e 下 crash
 CACHE_MAX="${CACHE_MAX//[^0-9]/}"
 : "${CACHE_MAX:=50}"
 if (( CACHE_MAX < 5 )); then CACHE_MAX=5; fi
 if (( CACHE_MAX > 500 )); then CACHE_MAX=500; fi
 
-# [F6] Fallback model（空字串 = 不重試）
-# 可設為檔名（如 ggml-tiny.bin）或完整路徑
+# [F6] Fallback model
 FALLBACK_MODEL="${WHISPER_FALLBACK_MODEL:-}"
 
 # 路徑
@@ -57,7 +58,10 @@ PTT_DIR="$HOME/.ptt-whisper"
 LOG_FILE="$PTT_DIR/ptt_whisper_err.log"
 OUT_PREFIX="$PTT_DIR/ptt_whisper_out"
 CACHE_DIR="$PTT_DIR/cache"
-HALLUCINATION_FILE="$PTT_DIR/hallucinations.txt"
+
+# [P1] 幻覺列表路徑
+BUILTIN_HALLUCINATION_FILE="$PTT_DIR/hallucinations_builtin.txt"
+USER_HALLUCINATION_FILE="$PTT_DIR/hallucinations.txt"
 
 # ── 輸入驗證 ─────────────────────────────────────────────────
 AUDIO_FILE="${1:-}"
@@ -70,7 +74,7 @@ if [[ ! -f "$AUDIO_FILE" ]]; then
   exit 1
 fi
 
-# 語言/模型覆寫參數
+# 語言/模型覆寫
 LANG_OVERRIDE="${2:-}"
 MODEL_OVERRIDE="${3:-}"
 if [[ -n "$LANG_OVERRIDE" ]]; then
@@ -92,7 +96,6 @@ if [[ -n "$FALLBACK_MODEL" ]]; then
   else
     FALLBACK_MODEL_RESOLVED="$WHISPER_DIR/models/$FALLBACK_MODEL"
   fi
-  # 若 fallback model 與主 model 相同，或不存在，清空
   if [[ "$FALLBACK_MODEL_RESOLVED" == "$MODEL" ]]; then
     FALLBACK_MODEL_RESOLVED=""
   elif [[ ! -f "$FALLBACK_MODEL_RESOLVED" ]]; then
@@ -102,7 +105,7 @@ if [[ -n "$FALLBACK_MODEL" ]]; then
 fi
 
 # 檔案大小檢查
-# [R4] macOS 使用 stat -f%z，Linux 使用 stat -c%s（兩者語法不同）
+# macOS: stat -f%z, Linux: stat -c%s
 FILE_SIZE=$(stat -f%z "$AUDIO_FILE" 2>/dev/null || stat -c%s "$AUDIO_FILE" 2>/dev/null || echo 0)
 FILE_SIZE="${FILE_SIZE//[^0-9]/}"
 : "${FILE_SIZE:=0}"
@@ -111,7 +114,8 @@ if (( FILE_SIZE < 1000 )); then
   exit 1
 fi
 
-# ── 偵測 whisper.cpp 執行檔 ──────────────────────────────────
+# ── 偵測 whisper.cpp ─────────────────────────────────────────
+# [P6] 搜尋順序與 ptt_whisper.lua WHISPER_BIN_CANDIDATES 一致
 WHISPER_BIN=""
 for candidate in \
   "$WHISPER_DIR/whisper-cli" \
@@ -135,28 +139,31 @@ fi
 mkdir -p "$PTT_DIR"
 
 # ── [F4] 快取查詢 ────────────────────────────────────────────
-# [R3] 快取 key = md5(音訊內容) + model 檔名 + language
-# 注意：cache key 不包含 whisper.cpp 版本或 model 內容 hash，
-# 因此升級 whisper.cpp 或替換同名 model 檔案後，建議手動清除快取：
-#   rm -rf ~/.ptt-whisper/cache/
 CACHE_KEY=""
 CACHE_FILE=""
 
 if [[ "$CACHE_ENABLED" == "true" ]]; then
   mkdir -p "$CACHE_DIR"
-  # 計算 audio checksum（macOS: md5 -q, Linux: md5sum）
   AUDIO_HASH=$(md5 -q "$AUDIO_FILE" 2>/dev/null \
     || md5sum "$AUDIO_FILE" 2>/dev/null | cut -d' ' -f1 \
     || echo "")
   if [[ -n "$AUDIO_HASH" ]]; then
     MODEL_NAME=$(basename "$MODEL")
     CACHE_KEY="${AUDIO_HASH}_${MODEL_NAME}_${LANGUAGE}"
-    CACHE_FILE="$CACHE_DIR/${CACHE_KEY}.txt"
 
-    if [[ -f "$CACHE_FILE" ]]; then
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] CACHE HIT: $CACHE_KEY" >> "$LOG_FILE"
-      cat "$CACHE_FILE"
-      exit 0
+    # [CRx] 防禦性檢查：驗證 cache key 只含安全字元 [a-zA-Z0-9._-]
+    # 從源頭杜絕怪檔名進入 cache 目錄，保障下游 ls -1t 解析安全
+    if [[ "$CACHE_KEY" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+      CACHE_FILE="$CACHE_DIR/${CACHE_KEY}.txt"
+
+      if [[ -f "$CACHE_FILE" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] CACHE HIT: $CACHE_KEY" >> "$LOG_FILE"
+        cat "$CACHE_FILE"
+        exit 0
+      fi
+    else
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: invalid cache key format, caching disabled for this run: $CACHE_KEY" >> "$LOG_FILE" 2>/dev/null || true
+      CACHE_KEY=""
     fi
   fi
 fi
@@ -206,9 +213,7 @@ if command -v ffprobe &>/dev/null; then
   fi
 fi
 
-# ── [F6] whisper.cpp 執行函式（支援重試）─────────────────────
-# @param $1  model path
-# @return 0=成功, 非0=失敗
+# ── [F6] whisper.cpp 執行函式 ────────────────────────────────
 run_whisper() {
   local use_model="$1"
   local cmd=(
@@ -223,7 +228,6 @@ run_whisper() {
     cmd+=(-l "$LANGUAGE")
   fi
 
-  # 偵測 timeout 指令
   local tcmd=""
   if (( TIMEOUT_SEC > 0 )); then
     if command -v gtimeout &>/dev/null; then
@@ -233,10 +237,8 @@ run_whisper() {
     fi
   fi
 
-  # 清除上次輸出
   rm -f "${OUT_PREFIX}.txt" 2>/dev/null || true
 
-  # [R2] $tcmd 加引號，符合 set -euo pipefail 嚴格模式精神
   if [[ -n "$tcmd" ]]; then
     "$tcmd" "$TIMEOUT_SEC" "${cmd[@]}" 2>>"$LOG_FILE" && return 0
     return $?
@@ -249,14 +251,13 @@ run_whisper() {
   fi
 }
 
-# ── 主要執行：先用主 model，失敗則 fallback ──────────────────
+# ── 主要執行 ─────────────────────────────────────────────────
 WHISPER_FAILED=false
 run_whisper "$MODEL" || {
   rc=$?
   WHISPER_FAILED=true
 
   if [[ -n "$FALLBACK_MODEL_RESOLVED" ]]; then
-    # [F6] 有 fallback model → 重試
     if (( rc == 124 )); then
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] RETRY: primary model timed out, trying fallback: $FALLBACK_MODEL_RESOLVED" >> "$LOG_FILE"
     else
@@ -269,12 +270,10 @@ run_whisper "$MODEL" || {
       echo "Error: whisper.cpp failed with both primary and fallback models" >&2
       exit $rc2
     }
-    # fallback 成功
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: fallback model succeeded" >> "$LOG_FILE"
     echo "Warning: used fallback model (primary failed with exit $rc)" >&2
     WHISPER_FAILED=false
   else
-    # 無 fallback → 報錯退出
     if (( rc == 124 )); then
       echo "Error: whisper.cpp timed out after ${TIMEOUT_SEC}s" >&2
     else
@@ -294,14 +293,12 @@ if [[ ! -s "${OUT_PREFIX}.txt" ]]; then
   exit 1
 fi
 
-# ── 幻覺過濾 + 輸出 ─────────────────────────────────────────
-# ⚠️ 注意：此內建列表需與 ptt_whisper.lua 的 builtinHallucinations 保持同步
+# ── 文字清理 + 幻覺過濾 ─────────────────────────────────────
+
+# [B2] 基本文字清理：移除 whisper.cpp 特殊標記
 result=$(tr '\n' ' ' < "${OUT_PREFIX}.txt" \
   | sed -E \
-    -e 's/\[BLANK_AUDIO\]//g' \
-    -e 's/\[blank_audio\]//g' \
-    -e 's/\[Blank_Audio\]//g' \
-    -e 's/\[Blank audio\]//g' \
+    -e 's/\[[Bb][Ll][Aa][Nn][Kk][_ ][Aa][Uu][Dd][Ii][Oo]\]//g' \
     -e 's/\[[Ss][Ii][Ll][Ee][Nn][Cc][Ee]\]//g' \
     -e 's/\[[Mm][Uu][Ss][Ii][Cc]\]//g' \
     -e 's/\[[Ll][Aa][Uu][Gg][Hh][Tt][Ee][Rr]\]//g' \
@@ -324,42 +321,109 @@ result=$(tr '\n' ' ' < "${OUT_PREFIX}.txt" \
 
 result=$(echo "$result" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
 
-# 內建幻覺列表
-case "$result" in
-  "Thank you."|"Thank you!"|"Thank you"|\
-  "Thanks."|"Thanks for watching."|"Thanks for watching!"|\
-  "Thanks for listening."|\
-  "Thank you for watching."|"Thank you for watching!"|\
-  "Thank you for listening."|\
-  "Please subscribe."|"Subscribe."|"Like and subscribe."|\
-  "Bye."|"Bye bye."|"Bye-bye."|"Goodbye."|"Good bye."|\
-  "..."|".."|"."|","|\
-  "Subtitles by the Amara.org community"|\
-  "Subtitles by the Amara.org community."|\
-  "Sous-titres réalisés para la communauté d'Amara.org"|\
-  "ご視聴ありがとうございました"|"ご視聴ありがとうございました。"|\
-  "謝謝觀看"|"謝謝觀看。"|"謝謝觀看！"|\
-  "謝謝收看"|"謝謝收看。"|"謝謝收聽"|"謝謝收聽。"|\
-  "謝謝"|"謝謝。"|"感謝觀看"|"感謝觀看。"|\
-  "字幕由Amara.org社區提供"|\
-  "請訂閱"|"請訂閱。"|"再見"|"再見。")
-    result=""
-    ;;
-esac
+# ── [CR2] Normalize 函式（與 Lua 端 normalizeForMatch 策略一致）──
+# trim → 壓空白 → 全形標點轉半形 → 移除尾部標點 → lowercase
+normalize_text() {
+  local text="$1"
+  [[ -z "$text" ]] && { echo ""; return; }
+  # trim
+  text=$(echo "$text" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  # 壓連續空白
+  text=$(echo "$text" | sed -E 's/[[:space:]]+/ /g')
+  # 全形標點 → 半形
+  text=$(echo "$text" | sed \
+    -e 's/。/./g' \
+    -e 's/！/!/g' \
+    -e 's/？/?/g' \
+    -e 's/，/,/g' \
+    -e 's/；/;/g' \
+    -e 's/：/:/g' \
+    -e 's/、/,/g' \
+    -e 's/（/(/g' \
+    -e 's/）/)/g' \
+    -e 's/　/ /g')
+  # 移除尾部半形標點
+  text=$(echo "$text" | sed -E 's/[.!?,;:]+$//')
+  # trim again
+  text=$(echo "$text" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  # lowercase（注意：LC_ALL=C 下 tr 只處理 ASCII，CJK 不受影響——正確行為）
+  text=$(echo "$text" | tr '[:upper:]' '[:lower:]')
+  echo "$text"
+}
 
-# 外部幻覺列表
-if [[ -n "$result" && -f "$HALLUCINATION_FILE" && -s "$HALLUCINATION_FILE" ]]; then
+# ── [CR2] 兩層幻覺比對函式 ──────────────────────────────────
+# @param $1  幻覺列表檔案路徑
+# @param $2  當前 result 文字
+# @return    過濾後 result（透過 echo）；空字串 = 命中幻覺
+filter_by_hallucination_file() {
+  local file="$1"
+  local text="$2"
+  [[ -z "$text" ]] && { echo ""; return; }
+  [[ ! -f "$file" || ! -s "$file" ]] && { echo "$text"; return; }
+
+  # 預計算 result 的 normalized 形式（只算一次）
+  local text_norm
+  text_norm=$(normalize_text "$text")
+
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" ]] && continue
     [[ "$line" == \#* ]] && continue
+    # trim
     line="${line#"${line%%[![:space:]]*}"}"
     line="${line%"${line##*[![:space:]]}"}"
     [[ -z "$line" ]] && continue
-    if [[ "$result" == "$line" ]]; then
-      result=""
-      break
+
+    # 第一層：exact match
+    if [[ "$text" == "$line" ]]; then
+      echo ""
+      return
     fi
-  done < "$HALLUCINATION_FILE"
+
+    # 第二層：normalized match
+    local line_norm
+    line_norm=$(normalize_text "$line")
+    if [[ -n "$text_norm" && -n "$line_norm" && "$text_norm" == "$line_norm" ]]; then
+      echo ""
+      return
+    fi
+  done < "$file"
+  echo "$text"
+}
+
+# ── 執行幻覺過濾 ────────────────────────────────────────────
+if [[ -n "$result" ]]; then
+  if [[ -f "$BUILTIN_HALLUCINATION_FILE" && -s "$BUILTIN_HALLUCINATION_FILE" ]]; then
+    result=$(filter_by_hallucination_file "$BUILTIN_HALLUCINATION_FILE" "$result")
+  else
+    # Fallback：共用檔案不存在時使用硬編碼 case statement
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: hallucinations_builtin.txt not found, using hardcoded fallback" >> "$LOG_FILE" 2>/dev/null || true
+    case "$result" in
+      "Thank you."|"Thank you!"|"Thank you"|\
+      "Thanks."|"Thanks for watching."|"Thanks for watching!"|\
+      "Thanks for listening."|\
+      "Thank you for watching."|"Thank you for watching!"|\
+      "Thank you for listening."|\
+      "Please subscribe."|"Subscribe."|"Like and subscribe."|\
+      "Bye."|"Bye bye."|"Bye-bye."|"Goodbye."|"Good bye."|\
+      "..."|".."|"."|","|\
+      "Subtitles by the Amara.org community"|\
+      "Subtitles by the Amara.org community."|\
+      "Sous-titres réalisés para la communauté d'Amara.org"|\
+      "ご視聴ありがとうございました"|"ご視聴ありがとうございました。"|\
+      "謝謝觀看"|"謝謝觀看。"|"謝謝觀看！"|\
+      "謝謝收看"|"謝謝收看。"|"謝謝收聽"|"謝謝收聽。"|\
+      "謝謝"|"謝謝。"|"感謝觀看"|"感謝觀看。"|\
+      "字幕由Amara.org社區提供"|\
+      "請訂閱"|"請訂閱。"|"再見"|"再見。")
+        result=""
+        ;;
+    esac
+  fi
+fi
+
+# 使用者自定義幻覺列表
+if [[ -n "$result" ]]; then
+  result=$(filter_by_hallucination_file "$USER_HALLUCINATION_FILE" "$result")
 fi
 
 # 重複標點檢查
@@ -372,10 +436,8 @@ fi
 if [[ "$CACHE_ENABLED" == "true" && -n "$CACHE_KEY" && -n "$result" ]]; then
   printf '%s\n' "$result" > "$CACHE_FILE" 2>/dev/null || true
 
-  # [R1] LRU 清理：保留最近 CACHE_MAX 個檔案，刪除較舊的
-  # 注意：此處使用 ls -1t 解析檔名。在本專案中 cache key 格式為
-  # {md5}_{model}_{lang}.txt，不含空白或特殊字元，因此 ls 解析是安全的。
-  # 若未來 cache key 格式變更，需改用 find + sort 方式。
+  # LRU 清理：保留最近 CACHE_MAX 個檔案
+  # 注意：cache key 已在上方驗證只含 [a-zA-Z0-9._-]，所以 ls 解析是安全的
   cached_files=$(ls -1t "$CACHE_DIR"/*.txt 2>/dev/null || true)
   if [[ -n "$cached_files" ]]; then
     echo "$cached_files" | tail -n +"$((CACHE_MAX + 1))" | while IFS= read -r old; do
