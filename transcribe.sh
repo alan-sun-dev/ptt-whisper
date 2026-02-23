@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================
-# transcribe.sh v2.8.3 — PTT Whisper 轉錄腳本
+# transcribe.sh v2.8.4 — PTT Whisper 轉錄腳本
 #
-# 搭配 ptt_whisper.lua v3.6.3 使用
+# 搭配 ptt_whisper.lua v3.6.4 使用
 # 用法：transcribe.sh /path/to/audio.wav [language] [model_path]
 #   language   — 覆寫 WHISPER_LANG（如 en, zh, ja）
 #                空字串 "" 或 "auto" = 不帶 -l，讓 whisper.cpp 自行偵測
@@ -11,12 +11,11 @@
 #                空字串 "" = 使用預設
 # 輸出：轉錄文字寫到 stdout（單行，去頭尾空白，含 trailing newline）
 #
-# v2.8.3 修正（第三輪 Code Review）：
-#  CR7.[Perf] normalize_text() 合併 sed 呼叫（7 次 fork → 2 次）
-#  CR8.[Refactor] 文字清理抽為 clean_whisper_output() 函式
-#  CR9.[Fix]  LRU 快取清理改用 find 取代 ls 解析
-#  CR10.[Doc] LC_ALL=C 與 UTF-8 幻覺比對的行為加註解
+# v2.8.4 修正（第四輪 Code Review）：
+#  CR12.[Fix]  LRU 快取清理的 stat 加入 Linux fallback（跨平台安全）
+#  CR13.[Perf] 幻覺比對從 O(N) forks 降為 O(1) forks（批次 normalize + grep）
 #
+# v2.8.3：CR7~CR10（第三輪 Code Review）
 # v2.8.2：OPT2（推理效能）
 # v2.8.1：CR2,CR6,CRx（第二輪 Code Review）
 # v2.8.0：P1,B2  v2.7.1：R1~R4  v2.7：F4,F6
@@ -180,6 +179,8 @@ cleanup() {
   if [[ -n "$RESAMPLE_TMPFILE" && -f "$RESAMPLE_TMPFILE" ]]; then
     rm -f "$RESAMPLE_TMPFILE" 2>/dev/null || true
   fi
+  # [CR13] 清理可能殘留的幻覺過濾暫存檔
+  rm -f "$PTT_DIR"/hall_clean_*.tmp "$PTT_DIR"/hall_norm_*.tmp 2>/dev/null || true
 }
 trap cleanup EXIT
 rm -f "${OUT_PREFIX}.txt" 2>/dev/null || true
@@ -352,7 +353,10 @@ normalize_text() {
   | tr '[:upper:]' '[:lower:]'
 }
 
-# ── [CR2] 兩層幻覺比對函式 ──────────────────────────────────
+# ── [CR2][CR13] 兩層幻覺比對函式 ──────────────────────────────
+# [CR13] 重構為批次處理：
+#   舊版：逐行呼叫 normalize_text → O(N) forks（50 行 = 100 forks）
+#   新版：整檔一次 sed+tr normalize → O(1) forks（固定 ~7 forks）
 # @param $1  幻覺列表檔案路徑
 # @param $2  當前 result 文字
 # @return    過濾後 result（透過 echo）；空字串 = 命中幻覺
@@ -362,32 +366,55 @@ filter_by_hallucination_file() {
   [[ -z "$text" ]] && { echo ""; return; }
   [[ ! -f "$file" || ! -s "$file" ]] && { echo "$text"; return; }
 
-  # 預計算 result 的 normalized 形式（只算一次）
+  # 建立清理過的幻覺列表（去除註解和空行，trim 每行）— 1 fork
+  local clean_tmp
+  clean_tmp=$(mktemp "$PTT_DIR/hall_clean_XXXXXX.tmp") || { echo "$text"; return; }
+  sed -e '/^[[:space:]]*$/d' -e '/^[[:space:]]*#/d' \
+      -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$file" > "$clean_tmp"
+
+  if [[ ! -s "$clean_tmp" ]]; then
+    rm -f "$clean_tmp"
+    echo "$text"
+    return
+  fi
+
+  # ── 第一層：exact match（1 fork: grep）──
+  if grep -Fxq -- "$text" "$clean_tmp" 2>/dev/null; then
+    rm -f "$clean_tmp"
+    echo ""
+    return
+  fi
+
+  # ── 第二層：normalized match ──
   local text_norm
-  text_norm=$(normalize_text "$text")
+  text_norm=$(normalize_text "$text")  # 2 forks (sed + tr)
+  if [[ -n "$text_norm" ]]; then
+    # [CR13] 批次 normalize 整個幻覺列表（2 forks：sed + tr）
+    # 取代逐行呼叫 normalize_text 的 N×2 forks
+    # sed 規則與 normalize_text() 完全一致，確保 Lua/Bash 行為對齊
+    local norm_tmp
+    norm_tmp=$(mktemp "$PTT_DIR/hall_norm_XXXXXX.tmp") || { rm -f "$clean_tmp"; echo "$text"; return; }
+    sed -E \
+      -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' \
+      -e 's/[[:space:]]+/ /g' \
+      -e 's/。/./g' -e 's/！/!/g' -e 's/？/?/g' \
+      -e 's/，/,/g' -e 's/；/;/g' -e 's/：/:/g' \
+      -e 's/、/,/g' -e 's/（/(/g' -e 's/）/)/g' \
+      -e 's/　/ /g' \
+      -e 's/[.!?,;:]+$//' \
+      -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' \
+      "$clean_tmp" | tr '[:upper:]' '[:lower:]' > "$norm_tmp"
 
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    [[ -z "$line" ]] && continue
-    [[ "$line" == \#* ]] && continue
-    # trim
-    line="${line#"${line%%[![:space:]]*}"}"
-    line="${line%"${line##*[![:space:]]}"}"
-    [[ -z "$line" ]] && continue
-
-    # 第一層：exact match
-    if [[ "$text" == "$line" ]]; then
+    # 1 fork: grep
+    if grep -Fxq -- "$text_norm" "$norm_tmp" 2>/dev/null; then
+      rm -f "$clean_tmp" "$norm_tmp"
       echo ""
       return
     fi
+    rm -f "$norm_tmp"
+  fi
 
-    # 第二層：normalized match
-    local line_norm
-    line_norm=$(normalize_text "$line")
-    if [[ -n "$text_norm" && -n "$line_norm" && "$text_norm" == "$line_norm" ]]; then
-      echo ""
-      return
-    fi
-  done < "$file"
+  rm -f "$clean_tmp"
   echo "$text"
 }
 
@@ -437,17 +464,30 @@ fi
 if [[ "$CACHE_ENABLED" == "true" && -n "$CACHE_KEY" && -n "$result" ]]; then
   printf '%s\n' "$result" > "$CACHE_FILE" 2>/dev/null || true
 
-  # [CR9] LRU 清理：保留最近 CACHE_MAX 個檔案
+  # [CR9][CR12] LRU 清理：保留最近 CACHE_MAX 個檔案
   # 使用 find + stat 取代 ls 解析，避免 glob 不展開時的邊界情況
-  # macOS find 不支援 -printf，改用 stat -f '%m %N' 取得 mtime
+  # [CR12] 跨平台 stat 格式：macOS 用 -f '%m %N'，Linux 用 -c '%Y %n'
   # cache key 已在上方驗證只含 [a-zA-Z0-9._-]，所以檔名不含空白或特殊字元
-  find "$CACHE_DIR" -maxdepth 1 -name '*.txt' -type f -exec stat -f '%m %N' {} + 2>/dev/null \
-    | sort -rn \
-    | tail -n +"$((CACHE_MAX + 1))" \
-    | cut -d' ' -f2- \
-    | while IFS= read -r old; do
-        [[ -n "$old" ]] && rm -f "$old" 2>/dev/null || true
-      done
+  # cut -d' ' -f2- 安全地取得完整路徑（即使理論上路徑含空白也正確）
+  if stat -f '%m %N' /dev/null &>/dev/null; then
+    # macOS / BSD: stat -f '%m %N' (modification time + filename)
+    find "$CACHE_DIR" -maxdepth 1 -name '*.txt' -type f -exec stat -f '%m %N' {} + 2>/dev/null \
+      | sort -rn \
+      | tail -n +"$((CACHE_MAX + 1))" \
+      | cut -d' ' -f2- \
+      | while IFS= read -r old; do
+          [[ -n "$old" ]] && rm -f "$old" 2>/dev/null || true
+        done
+  else
+    # Linux / GNU: stat -c '%Y %n' (modification time + filename)
+    find "$CACHE_DIR" -maxdepth 1 -name '*.txt' -type f -exec stat -c '%Y %n' {} + 2>/dev/null \
+      | sort -rn \
+      | tail -n +"$((CACHE_MAX + 1))" \
+      | cut -d' ' -f2- \
+      | while IFS= read -r old; do
+          [[ -n "$old" ]] && rm -f "$old" 2>/dev/null || true
+        done
+  fi
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] CACHE STORE: $CACHE_KEY" >> "$LOG_FILE"
 fi
 

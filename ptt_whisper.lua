@@ -1,14 +1,14 @@
 -- ============================================================
 -- Push-to-Talk Whisper Dictation for Hammerspoon
--- v3.6.3
+-- v3.6.4
 --
--- v3.6.3 修正（第三輪 Code Review）：
---   CR7.[Fix]  工作目錄初始化順序修正（mkdir 先於 loadExternalConfig）
---   CR8.[Perf] lowpass 3kHz → 5kHz，保留齒擦音頻帶提升英文辨識率
---   CR9.[Fix]  streamingFailCount 只在 reload 時重置，避免單次成功就清零
---   CR10.[Feat] Diagnostics 納入 config validation warnings
---   CR11.[Doc]  FFmpeg exitCode 255 行為加註解
+-- v3.6.4 修正（第四輪 Code Review）：
+--   CR12.[Fix]  loadExternalConfig 結構化回傳（區分無檔/空檔/解析失敗）
+--   CR13.[Fix]  streamingFailCount 改為漸進式衰減（成功 -1，非歸零）
+--   CR14.[Feat] Diagnostics 區分 Q5_0 / FP16 模型標籤
+--   CR15.[Feat] Diagnostics 新增濾波器鏈 dry-run 驗證
 --
+-- v3.6.3：CR7~CR11（第三輪 Code Review）
 -- v3.6.2：OPT1~OPT2（錄音品質 + 推理效能優化）
 -- v3.6.1：CR1~CR6（第二輪 Code Review）
 --
@@ -19,11 +19,11 @@
 -- v3.0：E~K  v2.1：A~D
 --
 -- 使用方式：按住 Right Option 錄音，放開後自動轉錄並貼上
--- 依賴：ffmpeg、whisper.cpp 已編譯、~/ptt-whisper/transcribe.sh v2.8.3+
+-- 依賴：ffmpeg、whisper.cpp 已編譯、~/ptt-whisper/transcribe.sh v2.8.4+
 -- ============================================================
 
 -- ── 版本常數 ────────────────────────────────────────────────
-local VERSION = "3.6.3"
+local VERSION = "3.6.4"
 
 -- ── 設定區（Config）──────────────────────────────────────────
 
@@ -62,6 +62,8 @@ local SOUND_REC_STOP    = "Pop"
 -- lowpass=f=5000  : 切除 5kHz 以上高頻嘶聲（電路雜音、風扇）
 --                   保留 4~5kHz 齒擦音頻帶（/s/, /ʃ/, /f/），避免英文辨識劣化
 -- loudnorm=I=-16:TP=-1.5 : EBU R128 感知響度正規化（防止忽大忽小）
+--   注意：loudnorm 在即時錄音（single-pass）模式下僅做近似正規化，
+--   對 PTT 的短音訊（2~15s）已足夠，但不等同於雙 pass 的精確結果
 -- 設為 "" 可停用濾波器；config.json 可透過 audio_filter_chain 覆寫
 local AUDIO_FILTER_CHAIN = "highpass=f=200,lowpass=f=5000,loudnorm=I=-16:TP=-1.5"
 
@@ -255,17 +257,28 @@ hs.fs.mkdir(PTT_DIR)
 hs.task.new("/bin/chmod", nil, {"700", PTT_DIR}):start()
 
 -- ── 外部設定檔載入 ──────────────────────────────────────────
+-- [CR12] 所有路徑都回傳結構化結果，讓 diagnostics 能區分：
+--   nil              → config.json 不存在（正常，首次啟動）
+--   { warnings = {"config.json 為空"} }         → 檔案存在但空
+--   { warnings = {"config.json JSON 解析失敗"} } → JSON 格式錯誤
+--   { warnings = {...} }                         → 正常載入（可能有欄位警告）
 local function loadExternalConfig()
   local f = io.open(CONFIG_FILE, "r")
-  if not f then return end
+  if not f then return nil end
   local ok, content = pcall(function() return f:read("*a") end)
   f:close()
-  if not ok or not content or content == "" then return end
+  if not ok or not content or content == "" then
+    if not ok then
+      print("[PTT Whisper] WARNING: config.json read error")
+      return { warnings = {"config.json 讀取失敗"} }
+    end
+    return { warnings = {"config.json 為空"} }
+  end
 
   local decodeOk, config = pcall(hs.json.decode, content)
   if not decodeOk or type(config) ~= "table" then
     print("[PTT Whisper] WARNING: config.json parse failed, ignoring")
-    return
+    return { warnings = {"config.json JSON 解析失敗，已忽略"} }
   end
 
   -- [CR3] 使用集中式驗證取代散落的 if-else
@@ -1086,7 +1099,7 @@ local function startStreaming()
   if streamTask:start() then
     playSound(SOUND_REC_START)
     -- [CR9] streamingFailCount 不在此處重置——
-    -- 只在 cleanup()（reload）時重置，避免單次成功就清零導致降級保護失效
+    -- [CR13] 成功時改為漸進式衰減（見 stopStreaming），避免歸零繞過降級保護
   else
     streamTask = nil; recordStartAt = nil
     currentState = STATE.IDLE
@@ -1128,6 +1141,18 @@ local function stopStreaming()
     if text == "" then
       abortToIdle("Ready", { alert = "🤔 未偵測到語音", icon = "🎤" })
       return
+    end
+
+    -- [CR13] Streaming 成功產出文字 → failCount 遞減 1（floor 0）
+    -- 漸進式衰減：不會被單次成功歸零繞過降級保護，
+    -- 但也不會讓偶發性的歷史失敗永久累積
+    -- 範例：fail 2 → success 1 → fail 1 → count=2（不觸發降級）
+    --       fail 2 → success 0 → fail 1 → count=3（觸發降級）
+    if streamingFailCount > 0 then
+      streamingFailCount = streamingFailCount - 1
+      appendErrorLog(string.format(
+        "streaming: success, failCount decayed to %d/%d",
+        streamingFailCount, STREAMING_FALLBACK_THRESHOLD))
     end
 
     currentState = STATE.PASTING
@@ -1208,13 +1233,24 @@ local function runDiagnostics()
     return "!此 build 不支援 --stream"
   end)
 
-  -- 5. Model 檔案
+  -- 5. [CR14] Model 檔案（含 Q5_0/FP16 標籤）
   check("Model 檔案", function()
     local modelPath = resolveModelPath(nil)
     if not modelPath then return "!預設 model 不存在" end
     local attr = hs.fs.attributes(modelPath)
     local sizeMB = attr and math.floor((attr.size or 0) / 1024 / 1024) or 0
-    return string.format("%s (%dMB)", modelPath, sizeMB)
+    -- [CR14] 標記模型類型，讓使用者一眼可辨是否正在使用量化版本
+    local tag
+    if modelPath:find("q5_0") then
+      tag = "Q5_0"
+    elseif modelPath:find("q5_1") then
+      tag = "Q5_1"
+    elseif modelPath:find("q8_0") then
+      tag = "Q8_0"
+    else
+      tag = "FP16"
+    end
+    return string.format("%s (%dMB) [%s]", modelPath, sizeMB, tag)
   end)
 
   -- 6. Fallback model
@@ -1305,11 +1341,32 @@ local function runDiagnostics()
   end)
 
   -- 13. [CR10] Config 驗證結果
+  -- [CR12] 現在能區分「無設定檔」vs「空檔」vs「JSON 壞掉」vs「正常+警告」
   check("config.json 驗證", function()
-    if not lastConfigValidation then return "無設定檔或未載入" end
+    if not lastConfigValidation then return "無設定檔（正常，使用預設值）" end
     local w = lastConfigValidation.warnings
     if not w or #w == 0 then return "通過（無警告）" end
     return "!" .. #w .. " 項警告：" .. table.concat(w, "; ")
+  end)
+
+  -- 14. [CR15] 濾波器鏈 dry-run 驗證
+  -- 使用 FFmpeg 的 lavfi 虛擬音源做一次快速 dry-run，
+  -- 驗證 -af 參數語法是否合法，避免實際錄音時才發現錯誤
+  check("濾波器鏈", function()
+    if AUDIO_FILTER_CHAIN == "" then return "已停用" end
+    local ffmpeg = findFFmpeg()
+    if not ffmpeg then return "!無法測試（ffmpeg 不存在）" end
+    local output, status = runCommandSync(ffmpeg,
+      {"-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
+       "-af", AUDIO_FILTER_CHAIN,
+       "-t", "0.01", "-f", "null", "-"},
+      {stderr = true})
+    if status then
+      return "語法正確 — " .. AUDIO_FILTER_CHAIN
+    end
+    -- 從 stderr 擷取第一個 Error 行
+    local errLine = (output or ""):match("[Ee]rror[^\n]*") or "語法錯誤"
+    return "!" .. errLine
   end)
 
   -- 組裝報告
