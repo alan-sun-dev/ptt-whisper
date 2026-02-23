@@ -64,7 +64,7 @@ bash ./models/download-ggml-model.sh small.en    # 純英文場景
 
 ```bash
 # Clone repo
-git clone https://github.com/<your-username>/ptt-whisper.git ~/ptt-whisper
+git clone https://github.com/alan-sun-dev/ptt-whisper.git ~/ptt-whisper
 
 # 部署 transcribe.sh
 chmod +x ~/ptt-whisper/transcribe.sh
