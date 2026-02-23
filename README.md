@@ -48,17 +48,42 @@
 brew install --cask hammerspoon
 
 # ffmpeg + coreutils
-brew install ffmpeg coreutils
+brew install ffmpeg coreutils cmake
 
 # whisper.cpp
-git clone https://github.com/ggerganov/whisper.cpp.git ~/whisper.cpp
-cd ~/whisper.cpp && make -j
+git clone https://github.com/ggml-org/whisper.cpp.git ~/whisper.cpp
+cd ~/whisper.cpp
+
+# 建置（基本版，傳統模式用）
+cmake -B build
+cmake --build build -j --config Release
+
+# 若需要 Streaming 模式，改用以下（需要 SDL2）：
+# brew install sdl2
+# cmake -B build -DWHISPER_SDL2=ON
+# cmake --build build -j --config Release
 
 # 下載模型（擇一）
-bash ./models/download-ggml-model.sh small      # 推薦，平衡速度與品質
-bash ./models/download-ggml-model.sh tiny        # 最快，可做 fallback
-bash ./models/download-ggml-model.sh small.en    # 純英文場景
+# FP16 完整版（推薦，多語言）
+bash ./models/download-ggml-model.sh small
+
+# 量化版（二擇一）：
+# 方案 A：直接下載 Q5_1（推薦，最簡單）
+bash ./models/download-ggml-model.sh small-q5_1
+
+# 方案 B：自行量化為 Q5_0（與程式碼預設檔名一致）
+./build/bin/quantize models/ggml-small.bin models/ggml-small-q5_0.bin q5_0
+
+# 可選：tiny 做 fallback
+bash ./models/download-ggml-model.sh tiny
 ```
+---
+
+**另外需要考慮的程式碼層面影響：**
+
+如果選方案 A（下載 `small-q5_1`），則 `ptt_whisper.lua` 和 `transcribe.sh` 中的 fallback 檔名需要同步修改：
+```
+ggml-small-q5_0.bin → ggml-small-q5_1.bin
 
 ### 2. 安裝 PTT Whisper
 
