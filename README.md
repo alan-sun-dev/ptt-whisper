@@ -79,6 +79,22 @@ bash ./models/download-ggml-model.sh tiny
 ```
 ---
 
+建議兩個都裝，各有用途：
+bashcd ~/whisper.cpp
+
+# 量化版（日常使用）
+bash ./models/download-ggml-model.sh small-q5_1
+
+# FP16 完整版（備用）
+bash ./models/download-ggml-model.sh small
+理由很簡單：
+Q5_1 量化版FP16 完整版檔案大小~182 MB~466 MB記憶體佔用~200 MB~500 MB推理速度2-3x 更快1x 基準準確率幾乎無損基準適合場景PTT 日常使用fallback / 比對用
+PTT 的錄音只有 2-15 秒，量化版的微小精度差異根本感知不到，但速度差很明顯。
+
+不過有一個問題要處理：你的程式碼預設找的是 ggml-small-q5_0.bin，但下載腳本提供的是 q5_1。有兩個選法：
+方案 A（改程式碼，推薦）：把程式碼中的 q5_0 改為 q5_1，這樣直接下載就能用，不用手動量化。
+方案 B（自己量化）：先下載 FP16，再用 build 出來的工具自行產生 q5_0：
+
 **另外需要考慮的程式碼層面影響：**
 
 如果選方案 A（下載 `small-q5_1`），則 `ptt_whisper.lua` 和 `transcribe.sh` 中的 fallback 檔名需要同步修改：
