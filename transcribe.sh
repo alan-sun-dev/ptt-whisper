@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================
-# transcribe.sh v2.8.2 — PTT Whisper 轉錄腳本
+# transcribe.sh v2.8.3 — PTT Whisper 轉錄腳本
 #
-# 搭配 ptt_whisper.lua v3.6.2 使用
+# 搭配 ptt_whisper.lua v3.6.3 使用
 # 用法：transcribe.sh /path/to/audio.wav [language] [model_path]
 #   language   — 覆寫 WHISPER_LANG（如 en, zh, ja）
 #                空字串 "" 或 "auto" = 不帶 -l，讓 whisper.cpp 自行偵測
@@ -11,11 +11,13 @@
 #                空字串 "" = 使用預設
 # 輸出：轉錄文字寫到 stdout（單行，去頭尾空白，含 trailing newline）
 #
-# v2.8.2 優化（推理效能）：
-#  OPT2.[Perf] 預設 model 改為 Q5_0 量化版
-#       速度 2~3x、記憶體 -50%、準確率幾乎無損
-#       若 Q5_0 不存在自動 fallback 到原始 FP16 版本
+# v2.8.3 修正（第三輪 Code Review）：
+#  CR7.[Perf] normalize_text() 合併 sed 呼叫（7 次 fork → 2 次）
+#  CR8.[Refactor] 文字清理抽為 clean_whisper_output() 函式
+#  CR9.[Fix]  LRU 快取清理改用 find 取代 ls 解析
+#  CR10.[Doc] LC_ALL=C 與 UTF-8 幻覺比對的行為加註解
 #
+# v2.8.2：OPT2（推理效能）
 # v2.8.1：CR2,CR6,CRx（第二輪 Code Review）
 # v2.8.0：P1,B2  v2.7.1：R1~R4  v2.7：F4,F6
 # v2.6.1：R1~R5  v2.6：F1~F3  v2.5：#20~#23  v2.4：#18~#19
@@ -26,6 +28,9 @@ umask 077
 
 # [CR6] 統一 locale — 確保 sed/sort/字元類在所有系統上行為一致
 # 這防止例如 [[:space:]] 在不同 locale 下包含不同字元的問題
+# [CR10] 注意：LC_ALL=C 下字元類（如 [[:space:]]）只匹配 ASCII 範圍，
+# 全形空白 U+3000 不會被自動捕捉，需在 normalize_text() 中顯式處理。
+# 這是刻意的 trade-off：犧牲全形字元的自動匹配，換取跨系統的一致性。
 export LC_ALL=C
 
 # ── 設定區 ───────────────────────────────────────────────────
@@ -152,7 +157,7 @@ if [[ "$CACHE_ENABLED" == "true" ]]; then
     CACHE_KEY="${AUDIO_HASH}_${MODEL_NAME}_${LANGUAGE}"
 
     # [CRx] 防禦性檢查：驗證 cache key 只含安全字元 [a-zA-Z0-9._-]
-    # 從源頭杜絕怪檔名進入 cache 目錄，保障下游 ls -1t 解析安全
+    # 從源頭杜絕怪檔名進入 cache 目錄，保障下游 find + stat 解析安全
     if [[ "$CACHE_KEY" =~ ^[a-zA-Z0-9._-]+$ ]]; then
       CACHE_FILE="$CACHE_DIR/${CACHE_KEY}.txt"
 
@@ -295,60 +300,56 @@ fi
 
 # ── 文字清理 + 幻覺過濾 ─────────────────────────────────────
 
-# [B2] 基本文字清理：移除 whisper.cpp 特殊標記
-result=$(tr '\n' ' ' < "${OUT_PREFIX}.txt" \
-  | sed -E \
-    -e 's/\[[Bb][Ll][Aa][Nn][Kk][_ ][Aa][Uu][Dd][Ii][Oo]\]//g' \
-    -e 's/\[[Ss][Ii][Ll][Ee][Nn][Cc][Ee]\]//g' \
-    -e 's/\[[Mm][Uu][Ss][Ii][Cc]\]//g' \
-    -e 's/\[[Ll][Aa][Uu][Gg][Hh][Tt][Ee][Rr]\]//g' \
-    -e 's/\([Cc]lears [Tt]hroat\)//g' \
-    -e 's/\([Cc]oughs?\)//g' \
-    -e 's/\([Cc]oughing\)//g' \
-    -e 's/\([Ll]aughs?\)//g' \
-    -e 's/\([Ll]aughing\)//g' \
-    -e 's/\([Ll]aughter\)//g' \
-    -e 's/\([Mm]usic\)//g' \
-    -e 's/\([Aa]pplause\)//g' \
-    -e 's/\([Ss]ilence\)//g' \
-    -e 's/\([Ss]ighs?\)//g' \
-    -e 's/\([Ss]niffs?\)//g' \
-    -e 's/\([Gg]asps?\)//g' \
-    -e 's/\([Bb]reathing\)//g' \
-    -e 's/[[:space:]]+/ /g' \
-    -e 's/^ //' \
-    -e 's/ $//')
+# ── [CR8] 文字清理函式：移除 whisper.cpp 特殊標記 ───────────
+clean_whisper_output() {
+  local file="$1"
+  tr '\n' ' ' < "$file" \
+    | sed -E \
+      -e 's/\[[Bb][Ll][Aa][Nn][Kk][_ ][Aa][Uu][Dd][Ii][Oo]\]//g' \
+      -e 's/\[[Ss][Ii][Ll][Ee][Nn][Cc][Ee]\]//g' \
+      -e 's/\[[Mm][Uu][Ss][Ii][Cc]\]//g' \
+      -e 's/\[[Ll][Aa][Uu][Gg][Hh][Tt][Ee][Rr]\]//g' \
+      -e 's/\([Cc]lears [Tt]hroat\)//g' \
+      -e 's/\([Cc]oughs?\)//g' \
+      -e 's/\([Cc]oughing\)//g' \
+      -e 's/\([Ll]aughs?\)//g' \
+      -e 's/\([Ll]aughing\)//g' \
+      -e 's/\([Ll]aughter\)//g' \
+      -e 's/\([Mm]usic\)//g' \
+      -e 's/\([Aa]pplause\)//g' \
+      -e 's/\([Ss]ilence\)//g' \
+      -e 's/\([Ss]ighs?\)//g' \
+      -e 's/\([Ss]niffs?\)//g' \
+      -e 's/\([Gg]asps?\)//g' \
+      -e 's/\([Bb]reathing\)//g' \
+      -e 's/[[:space:]]+/ /g' \
+      -e 's/^ //' \
+      -e 's/ $//' \
+    | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
 
-result=$(echo "$result" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+# [B2] 基本文字清理
+result=$(clean_whisper_output "${OUT_PREFIX}.txt")
 
-# ── [CR2] Normalize 函式（與 Lua 端 normalizeForMatch 策略一致）──
+# ── [CR2][CR7] Normalize 函式（與 Lua 端 normalizeForMatch 策略一致）──
 # trim → 壓空白 → 全形標點轉半形 → 移除尾部標點 → lowercase
+# [CR7] 合併所有 sed 呼叫為單一 pipeline（7 次 fork → 2 次），
+#       在大幻覺列表場景下避免 fork overhead 超過推理時間
 normalize_text() {
   local text="$1"
   [[ -z "$text" ]] && { echo ""; return; }
-  # trim
-  text=$(echo "$text" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-  # 壓連續空白
-  text=$(echo "$text" | sed -E 's/[[:space:]]+/ /g')
-  # 全形標點 → 半形
-  text=$(echo "$text" | sed \
-    -e 's/。/./g' \
-    -e 's/！/!/g' \
-    -e 's/？/?/g' \
-    -e 's/，/,/g' \
-    -e 's/；/;/g' \
-    -e 's/：/:/g' \
-    -e 's/、/,/g' \
-    -e 's/（/(/g' \
-    -e 's/）/)/g' \
-    -e 's/　/ /g')
-  # 移除尾部半形標點
-  text=$(echo "$text" | sed -E 's/[.!?,;:]+$//')
-  # trim again
-  text=$(echo "$text" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-  # lowercase（注意：LC_ALL=C 下 tr 只處理 ASCII，CJK 不受影響——正確行為）
-  text=$(echo "$text" | tr '[:upper:]' '[:lower:]')
-  echo "$text"
+  # 注意：LC_ALL=C 下 [[:space:]] 只匹配 ASCII 空白，
+  # 全形空白 U+3000 由顯式 sed 規則處理——這是正確且預期的行為
+  echo "$text" | sed -E \
+    -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' \
+    -e 's/[[:space:]]+/ /g' \
+    -e 's/。/./g' -e 's/！/!/g' -e 's/？/?/g' \
+    -e 's/，/,/g' -e 's/；/;/g' -e 's/：/:/g' \
+    -e 's/、/,/g' -e 's/（/(/g' -e 's/）/)/g' \
+    -e 's/　/ /g' \
+    -e 's/[.!?,;:]+$//' \
+    -e 's/^[[:space:]]+//' -e 's/[[:space:]]+$//' \
+  | tr '[:upper:]' '[:lower:]'
 }
 
 # ── [CR2] 兩層幻覺比對函式 ──────────────────────────────────
@@ -436,14 +437,17 @@ fi
 if [[ "$CACHE_ENABLED" == "true" && -n "$CACHE_KEY" && -n "$result" ]]; then
   printf '%s\n' "$result" > "$CACHE_FILE" 2>/dev/null || true
 
-  # LRU 清理：保留最近 CACHE_MAX 個檔案
-  # 注意：cache key 已在上方驗證只含 [a-zA-Z0-9._-]，所以 ls 解析是安全的
-  cached_files=$(ls -1t "$CACHE_DIR"/*.txt 2>/dev/null || true)
-  if [[ -n "$cached_files" ]]; then
-    echo "$cached_files" | tail -n +"$((CACHE_MAX + 1))" | while IFS= read -r old; do
-      [[ -n "$old" ]] && rm -f "$old" 2>/dev/null || true
-    done
-  fi
+  # [CR9] LRU 清理：保留最近 CACHE_MAX 個檔案
+  # 使用 find + stat 取代 ls 解析，避免 glob 不展開時的邊界情況
+  # macOS find 不支援 -printf，改用 stat -f '%m %N' 取得 mtime
+  # cache key 已在上方驗證只含 [a-zA-Z0-9._-]，所以檔名不含空白或特殊字元
+  find "$CACHE_DIR" -maxdepth 1 -name '*.txt' -type f -exec stat -f '%m %N' {} + 2>/dev/null \
+    | sort -rn \
+    | tail -n +"$((CACHE_MAX + 1))" \
+    | cut -d' ' -f2- \
+    | while IFS= read -r old; do
+        [[ -n "$old" ]] && rm -f "$old" 2>/dev/null || true
+      done
   echo "[$(date '+%Y-%m-%d %H:%M:%S')] CACHE STORE: $CACHE_KEY" >> "$LOG_FILE"
 fi
 

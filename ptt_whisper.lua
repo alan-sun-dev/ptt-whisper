@@ -1,15 +1,15 @@
 -- ============================================================
 -- Push-to-Talk Whisper Dictation for Hammerspoon
--- v3.6.2
+-- v3.6.3
 --
--- v3.6.2 優化（錄音品質 + 推理效能）：
---   OPT1.[Perf] FFmpeg 錄音加入聲學濾波器鏈
---        highpass 200Hz + lowpass 3kHz + loudnorm EBU R128
---        嘈雜環境下辨識準確率顯著提升，config 可覆寫或停用
---   OPT2.[Perf] 預設 model 改為 Q5_0 量化版
---        推理速度提升 2~3 倍、記憶體減半，準確率幾乎無損
---        若 Q5_0 不存在自動 fallback 到原始 FP16 版本
+-- v3.6.3 修正（第三輪 Code Review）：
+--   CR7.[Fix]  工作目錄初始化順序修正（mkdir 先於 loadExternalConfig）
+--   CR8.[Perf] lowpass 3kHz → 5kHz，保留齒擦音頻帶提升英文辨識率
+--   CR9.[Fix]  streamingFailCount 只在 reload 時重置，避免單次成功就清零
+--   CR10.[Feat] Diagnostics 納入 config validation warnings
+--   CR11.[Doc]  FFmpeg exitCode 255 行為加註解
 --
+-- v3.6.2：OPT1~OPT2（錄音品質 + 推理效能優化）
 -- v3.6.1：CR1~CR6（第二輪 Code Review）
 --
 -- v3.6.0：P1~P6  v3.5.1：R6~R10  v3.5.0：F4~F7
@@ -19,11 +19,11 @@
 -- v3.0：E~K  v2.1：A~D
 --
 -- 使用方式：按住 Right Option 錄音，放開後自動轉錄並貼上
--- 依賴：ffmpeg、whisper.cpp 已編譯、~/ptt-whisper/transcribe.sh v2.8.2+
+-- 依賴：ffmpeg、whisper.cpp 已編譯、~/ptt-whisper/transcribe.sh v2.8.3+
 -- ============================================================
 
 -- ── 版本常數 ────────────────────────────────────────────────
-local VERSION = "3.6.2"
+local VERSION = "3.6.3"
 
 -- ── 設定區（Config）──────────────────────────────────────────
 
@@ -59,10 +59,11 @@ local SOUND_REC_STOP    = "Pop"
 
 -- [OPT1] 錄音聲學濾波器鏈（FFmpeg -af 參數）
 -- highpass=f=200  : 切除 200Hz 以下環境低頻噪音（冷氣、馬路隆隆聲）
--- lowpass=f=3000  : 切除 3kHz 以上高頻嘶聲（電路雜音、風扇）
+-- lowpass=f=5000  : 切除 5kHz 以上高頻嘶聲（電路雜音、風扇）
+--                   保留 4~5kHz 齒擦音頻帶（/s/, /ʃ/, /f/），避免英文辨識劣化
 -- loudnorm=I=-16:TP=-1.5 : EBU R128 感知響度正規化（防止忽大忽小）
 -- 設為 "" 可停用濾波器；config.json 可透過 audio_filter_chain 覆寫
-local AUDIO_FILTER_CHAIN = "highpass=f=200,lowpass=f=3000,loudnorm=I=-16:TP=-1.5"
+local AUDIO_FILTER_CHAIN = "highpass=f=200,lowpass=f=5000,loudnorm=I=-16:TP=-1.5"
 
 -- UI
 local SHOW_PREVIEW_ALERT = true
@@ -248,6 +249,11 @@ local function validateConfig(config)
   return { warnings = warnings }
 end
 
+-- ── [CR7] 工作目錄初始化（必須在 loadExternalConfig 之前）──────
+-- 確保 PTT_DIR 存在，否則首次啟動時 config.json 位於不存在的目錄下無法讀取
+hs.fs.mkdir(PTT_DIR)
+hs.task.new("/bin/chmod", nil, {"700", PTT_DIR}):start()
+
 -- ── 外部設定檔載入 ──────────────────────────────────────────
 local function loadExternalConfig()
   local f = io.open(CONFIG_FILE, "r")
@@ -263,14 +269,15 @@ local function loadExternalConfig()
   end
 
   -- [CR3] 使用集中式驗證取代散落的 if-else
-  validateConfig(config)
+  -- [CR10] 儲存 warnings 供 diagnostics 使用
+  local result = validateConfig(config)
+  return result
 end
 
-loadExternalConfig()
+-- [CR10] 儲存最近一次 config 驗證結果
+local lastConfigValidation = nil
 
--- ── 工作目錄初始化 ──────────────────────────────────────────
-hs.fs.mkdir(PTT_DIR)
-hs.task.new("/bin/chmod", nil, {"700", PTT_DIR}):start()
+lastConfigValidation = loadExternalConfig()
 
 -- ── Reload 防護 ─────────────────────────────────────────────
 if PTTWhisper and PTTWhisper._cleanup then
@@ -859,6 +866,8 @@ local function startRecording()
 
   recordTask = hs.task.new(ffmpeg, function(exitCode, _, stderr)
     cancelKillFallbackTimer()
+    -- [CR11] FFmpeg 收到 SIGINT（正常終止錄音）時在 macOS 回傳 255，
+    -- 這是預期行為而非錯誤，因此 255 與 0 一樣不觸發錯誤處理。
     if exitCode ~= 0 and exitCode ~= 255 and currentState == STATE.RECORDING then
       hs.timer.doAfter(0, function()
         recordTask = nil
@@ -1076,7 +1085,8 @@ local function startStreaming()
 
   if streamTask:start() then
     playSound(SOUND_REC_START)
-    streamingFailCount = 0
+    -- [CR9] streamingFailCount 不在此處重置——
+    -- 只在 cleanup()（reload）時重置，避免單次成功就清零導致降級保護失效
   else
     streamTask = nil; recordStartAt = nil
     currentState = STATE.IDLE
@@ -1294,6 +1304,14 @@ local function runDiagnostics()
     return string.format("%d 條規則（+ normalized 兩層比對）", count)
   end)
 
+  -- 13. [CR10] Config 驗證結果
+  check("config.json 驗證", function()
+    if not lastConfigValidation then return "無設定檔或未載入" end
+    local w = lastConfigValidation.warnings
+    if not w or #w == 0 then return "通過（無警告）" end
+    return "!" .. #w .. " 項警告：" .. table.concat(w, "; ")
+  end)
+
   -- 組裝報告
   local header = string.format(
     "=== PTT Whisper v%s Diagnostics ===\n%s\nMode: %s",
@@ -1421,7 +1439,7 @@ if menubarItem then
               f:write('  "streaming_mode": false,\n')
               f:write('  "cache_enabled": false,\n')
               f:write('  "fallback_model": "",\n')
-              f:write('  "audio_filter_chain": "highpass=f=200,lowpass=f=3000,loudnorm=I=-16:TP=-1.5",\n')
+              f:write('  "audio_filter_chain": "highpass=f=200,lowpass=f=5000,loudnorm=I=-16:TP=-1.5",\n')
               f:write('  "lang_models": {\n')
               f:write('    "_default": { "lang": "auto" }\n')
               f:write('  }\n')
