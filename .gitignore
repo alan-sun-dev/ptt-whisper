@@ -1,0 +1,25 @@
+# ── macOS ──────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# ── PTT Whisper runtime files ─────────────
+# 這些檔案由程式自動產生，不應進入版控
+*.wav
+ptt_whisper_out.txt
+ptt_whisper_err.log
+ptt_whisper_err.log.*
+diagnostics.txt
+cache/
+
+# 使用者設定（含個人偏好，不進版控；提供 config_example.json）
+config.json
+hallucinations.txt
+
+# ── IDE / Editor ──────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

@@ -1,0 +1,21 @@
+{
+  "slow_paste_apps": {
+    "com.tinyspeck.slackmacgap": 1.0,
+    "com.microsoft.teams2": 1.0
+  },
+  "show_preview_alert": true,
+
+  "streaming_mode": false,
+  "streaming_step_ms": 500,
+  "streaming_length_ms": 5000,
+
+  "cache_enabled": false,
+  "fallback_model": "ggml-tiny.bin",
+
+  "lang_models": {
+    "com.tinyspeck.slackmacgap":   { "lang": "en", "model": "ggml-small.en.bin" },
+    "com.microsoft.teams2":        { "lang": "en", "model": "ggml-small.en.bin" },
+    "jp.naver.line.mac":           { "lang": "zh" },
+    "_default":                    { "lang": "auto" }
+  }
+}
