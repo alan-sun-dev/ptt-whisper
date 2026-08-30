@@ -999,11 +999,18 @@ end
 
 --- [SV1] 讀 transcribe.sh 寫下的後端標記。
 --- server 模式會靜默退回 CLI，沒有這個顯示使用者無從得知它到底有沒有在用。
+--- 值可能是 server / cli / cache:server / cache:cli
+--- 快取命中會保留是哪個 backend 的 namespace，否則開了 server 卻一直命中
+--- 快取時，使用者看不出 server 到底有沒有在用。
 local function lastBackendLabel()
   local f = io.open(PTT_DIR .. "/last_backend.txt", "r")
   if not f then return "尚無記錄" end
   local v = (f:read("*l") or ""):match("^%s*(.-)%s*$")
   f:close()
+  local cached = v:match("^cache:(.+)$")
+  if cached then
+    return "📦 快取（" .. (cached == "server" and "server" or "CLI") .. " 產生）"
+  end
   if v == "server" then return "⚡ server" end
   if v == "cli" then return "📼 CLI" end
   return "尚無記錄"
@@ -1675,7 +1682,8 @@ local function runDiagnostics()
   check("上次轉錄後端", function()
     local label = lastBackendLabel()
     if label == "尚無記錄" then return "尚無記錄（還沒轉錄過）" end
-    -- 開了 server 卻一直走 CLI，代表有東西不對，值得提醒
+    -- 開了 server 卻實際走 CLI，代表有東西不對，值得提醒。
+    -- 快取命中不算——那不是降級。
     if SERVER_MODE and label == "📼 CLI" then
       return "!" .. label .. " — server_mode 已開啟但上次走的是 CLI，見 Error Log"
     end

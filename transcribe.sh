@@ -337,48 +337,95 @@ case "$VAD_MODE" in
     ;;
 esac
 
-# ── [F4] 快取查詢 ────────────────────────────────────────────
+# ── [SV1] 這次請求能不能走 server ────────────────────────────
+# 定義提前到快取之前：快取 identity 需要知道「預計會用哪個 backend」。
+server_usable() {
+  local use_model="$1"
+  [[ "$SERVER_MODE" == "true" ]] || return 1
+  command -v curl &>/dev/null || {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: WHISPER_SERVER=true but curl not found" >> "$LOG_FILE"
+    return 1
+  }
+  # 模型不一致就走 CLI（見 SERVER_MODEL 的說明）
+  if [[ -n "$SERVER_MODEL" && "$SERVER_MODEL" != "$use_model" ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: model differs from server ($use_model != $SERVER_MODEL), using CLI" >> "$LOG_FILE"
+    return 1
+  fi
+  return 0
+}
+
+# ── [F4][BK1] 快取：identity 描述「實際推理行為」 ─────────────
+# backend 必須進 cache key（server 是否真的吃下 prompt / max_context 取決於
+# 它的版本，不能假設兩條路徑等價）。但 SERVER_MODE 只代表「希望用 server」，
+# 不代表「這次真的由 server 完成」——server 請求失敗會退回 CLI。
+# 若把 CLI 產生的結果寫進 server 的 namespace，下次 server 正常時就會拿到
+# 一份其實由 CLI 產生的結果，isolation 的契約就破了。
+#
+# 因此：
+#   查詢 —— 用「預計使用的 backend」查一次；真的降級到 CLI 時，
+#           在確定 backend 之後再用 CLI 的 identity 查第二次
+#   寫入 —— 一律用「實際完成推理的 backend」
 CACHE_KEY=""
 CACHE_FILE=""
+AUDIO_HASH=""
 
 if [[ "$CACHE_ENABLED" == "true" ]]; then
   mkdir -p "$CACHE_DIR"
   AUDIO_HASH=$(md5 -q "$AUDIO_FILE" 2>/dev/null \
     || md5sum "$AUDIO_FILE" 2>/dev/null | cut -d' ' -f1 \
     || echo "")
-  if [[ -n "$AUDIO_HASH" ]]; then
-    MODEL_NAME=$(basename "$MODEL")
-
-    # [P3] prompt / VAD / max-context 都會改變轉錄輸出，因此必須進 cache key，
-    # 否則改了 prompt 之後會拿到舊 prompt 產生的快取結果。
-    # backend 也納入：server 與 CLI 對同一組參數理論上輸出相同，但
-    # server 是否真的吃下 prompt/max_context 取決於它的版本，
-    # 因此不假設兩者等價，各自持有自己的快取。
-    VARIANT_RAW="${PROMPT}|${VAD_ENABLED}|${MAX_CONTEXT}|${SERVER_MODE}"
-    VARIANT_HASH=$(printf '%s' "$VARIANT_RAW" | md5 -q 2>/dev/null \
-      || printf '%s' "$VARIANT_RAW" | md5sum 2>/dev/null | cut -d' ' -f1 \
-      || echo "")
-    VARIANT_HASH="${VARIANT_HASH:0:8}"
-    : "${VARIANT_HASH:=none}"
-
-    CACHE_KEY="${AUDIO_HASH}_${MODEL_NAME}_${LANGUAGE}_${VARIANT_HASH}"
-
-    # [CRx] 防禦性檢查：驗證 cache key 只含安全字元 [a-zA-Z0-9._-]
-    # 從源頭杜絕怪檔名進入 cache 目錄，保障下游 find + stat 解析安全
-    if [[ "$CACHE_KEY" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-      CACHE_FILE="$CACHE_DIR/${CACHE_KEY}.txt"
-
-      if [[ -f "$CACHE_FILE" ]]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] CACHE HIT: $CACHE_KEY" >> "$LOG_FILE"
-        cat "$CACHE_FILE"
-        exit 0
-      fi
-    else
-      echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: invalid cache key format, caching disabled for this run: $CACHE_KEY" >> "$LOG_FILE" 2>/dev/null || true
-      CACHE_KEY=""
-    fi
+  if [[ -z "$AUDIO_HASH" ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: cannot compute audio hash (md5/md5sum not found in PATH), cache disabled for this run" >> "$LOG_FILE" 2>/dev/null || true
   fi
 fi
+
+# 依 backend 算出這次的 cache key/file。成功回 0，不可用回 1。
+cache_identity_for() {
+  local backend="$1" model_name variant_raw variant_hash
+  CACHE_KEY=""; CACHE_FILE=""
+  [[ "$CACHE_ENABLED" == "true" && -n "$AUDIO_HASH" ]] || return 1
+
+  model_name=$(basename "$MODEL")
+  # 所有會改變輸出的參數都要進來
+  variant_raw="${PROMPT}|${VAD_ENABLED}|${MAX_CONTEXT}|${backend}"
+  variant_hash=$(printf '%s' "$variant_raw" | md5 -q 2>/dev/null \
+    || printf '%s' "$variant_raw" | md5sum 2>/dev/null | cut -d' ' -f1 \
+    || echo "")
+  variant_hash="${variant_hash:0:8}"
+  : "${variant_hash:=none}"
+
+  local key="${AUDIO_HASH}_${model_name}_${LANGUAGE}_${variant_hash}"
+  # [CRx] 防禦性檢查：cache key 只能含 [a-zA-Z0-9._-]，
+  # 從源頭杜絕怪檔名進入 cache 目錄，保障下游 find + stat 解析安全
+  if [[ ! "$key" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: invalid cache key format, caching disabled for this run: $key" >> "$LOG_FILE" 2>/dev/null || true
+    return 1
+  fi
+  CACHE_KEY="$key"
+  CACHE_FILE="$CACHE_DIR/${key}.txt"
+  return 0
+}
+
+# 查快取；命中就直接輸出並結束整個腳本。
+cache_lookup_or_continue() {
+  local backend="$1"
+  cache_identity_for "$backend" || return 1
+  [[ -f "$CACHE_FILE" ]] || return 1
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] CACHE HIT ($backend): $CACHE_KEY" >> "$LOG_FILE"
+  # 標記來源是快取，並保留是哪個 backend 的 namespace，
+  # 否則開了 server 卻一直命中快取時，使用者看不出 server 有沒有在用
+  printf 'cache:%s\n' "$backend" > "$PTT_DIR/last_backend.txt" 2>/dev/null || true
+  cat "$CACHE_FILE"
+  exit 0
+}
+
+# 預計使用的 backend（尚未實際發出請求）
+if server_usable "$MODEL"; then
+  PLANNED_BACKEND="server"
+else
+  PLANNED_BACKEND="cli"
+fi
+cache_lookup_or_continue "$PLANNED_BACKEND" || true
 
 # ── Cleanup trap ─────────────────────────────────────────────
 RESAMPLE_TMPFILE=""
@@ -538,22 +585,6 @@ run_whisper_server() {
   return 0
 }
 
-# 判斷這次請求能不能走 server
-server_usable() {
-  local use_model="$1"
-  [[ "$SERVER_MODE" == "true" ]] || return 1
-  command -v curl &>/dev/null || {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: WHISPER_SERVER=true but curl not found" >> "$LOG_FILE"
-    return 1
-  }
-  # 模型不一致就走 CLI（見 SERVER_MODEL 的說明）
-  if [[ -n "$SERVER_MODEL" && "$SERVER_MODEL" != "$use_model" ]]; then
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: model differs from server ($use_model != $SERVER_MODEL), using CLI" >> "$LOG_FILE"
-    return 1
-  fi
-  return 0
-}
-
 # ── [SV1] 推理入口：先試 server，失敗就退回 CLI ──────────────
 SERVER_USED=false
 run_transcription() {
@@ -564,6 +595,10 @@ run_transcription() {
       return 0
     fi
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: falling back to CLI" >> "$LOG_FILE"
+    # [BK1] 現在才確定 backend 是 CLI。先前查的是 server 的 namespace，
+    # 這裡用 CLI 的 identity 再查一次——否則 server 持續失敗時，
+    # 明明有 CLI 的快取可用卻每次都重跑推理。
+    cache_lookup_or_continue "cli" || true
   fi
   run_whisper "$use_model"
 }
@@ -797,7 +832,14 @@ if [[ -n "$result" ]]; then
   [[ -z "$stripped" ]] && result=""
 fi
 
-# ── [F4] 寫入快取 ────────────────────────────────────────────
+# ── [F4][BK1] 寫入快取：一律用「實際完成推理的 backend」 ──────
+if [[ "$SERVER_USED" == "true" ]]; then
+  ACTUAL_BACKEND="server"
+else
+  ACTUAL_BACKEND="cli"
+fi
+cache_identity_for "$ACTUAL_BACKEND" || true
+
 if [[ "$CACHE_ENABLED" == "true" && -n "$CACHE_KEY" && -n "$result" ]]; then
   printf '%s\n' "$result" > "$CACHE_FILE" 2>/dev/null || true
 
@@ -825,7 +867,7 @@ if [[ "$CACHE_ENABLED" == "true" && -n "$CACHE_KEY" && -n "$result" ]]; then
           [[ -n "$old" ]] && rm -f "$old" 2>/dev/null || true
         done
   fi
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] CACHE STORE: $CACHE_KEY" >> "$LOG_FILE"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] CACHE STORE ($ACTUAL_BACKEND): $CACHE_KEY" >> "$LOG_FILE"
 fi
 
 printf '%s\n' "$result"
