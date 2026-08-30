@@ -7,6 +7,10 @@
 # ── PTT Whisper runtime files ─────────────
 # 這些檔案由程式自動產生，不應進入版控
 *.wav
+# 但測試 fixture 必須進版控——它們不是執行時產生的。
+# 少了這幾個檔案，fresh clone 的 ./tests/run.sh 會全數失敗，
+# 而在已經有這些檔案的開發機上卻是全綠，非常難察覺。
+!tests/fixtures/*.wav
 ptt_whisper_out.txt
 ptt_whisper_err.log
 ptt_whisper_err.log.*
