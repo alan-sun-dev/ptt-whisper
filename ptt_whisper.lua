@@ -1,6 +1,14 @@
 -- ============================================================
 -- Push-to-Talk Whisper Dictation for Hammerspoon
--- v4.0.0
+-- v4.0.1
+--
+-- v4.0.1 強化：
+--   H1.[Fix]  readiness 改用 GET /health（行程活著 ≠ 模型可用）
+--   H2.[Fix]  占用偵測與就緒偵測拆開，兩者語意不同
+--   H3.[Fix]  serverGeneration 守衛所有非同步 callback，消除 stale race
+--   H4.[Fix]  重啟改為等待舊行程真正結束，而非 sleep 固定秒數
+--   H5.[Fix]  快取 identity 改以「實際完成推理的 backend」為準
+--   H6.[Test] 加入 ./tests/run.sh 常駐迴歸測試套件
 --
 -- v4.0.0 移除（breaking）：
 --   RM1.[Remove] Streaming 模式整套移除。它是一條繞過統一後處理管線的
@@ -31,11 +39,11 @@
 -- v3.0：E~K  v2.1：A~D
 --
 -- 使用方式：按住 Right Option 錄音，放開後自動轉錄並貼上
--- 依賴：ffmpeg、whisper.cpp 已編譯、~/ptt-whisper/transcribe.sh v2.10.0+
+-- 依賴：ffmpeg、whisper.cpp 已編譯、~/ptt-whisper/transcribe.sh v2.10.1+
 -- ============================================================
 
 -- ── 版本常數 ────────────────────────────────────────────────
-local VERSION = "4.0.0"
+local VERSION = "4.0.1"
 
 -- ── 設定區（Config）──────────────────────────────────────────
 

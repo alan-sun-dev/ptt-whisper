@@ -201,7 +201,7 @@ Hammerspoon Console → hs.reload()
 | `audio_filter_chain` | string | 見下方 | 錄音時的 FFmpeg `-af` 濾波器鏈，設為 `""` 停用 |
 | `initial_prompt` | string | `""` | 全域術語表（見「術語注入」）|
 | `vad_enabled` | bool 或 `"auto"` | `"auto"` | 靜音偵測。`auto` = 支援且有 model 才啟用 |
-| `max_context` | number | `0` | 跨段上下文 token 數，有效 0~224。`0` 可減少重複／拖尾幻覺 |
+| `max_context` | number | `0` | 跨段上下文 token 數，有效 0~224。見下方說明 |
 | `whisper_threads` | number | `0` | 推理執行緒數，有效 0~16。`0` = 自動偵測 |
 | `server_mode` | bool | `false` | 啟用常駐 whisper-server（見「常駐 Server 模式」）|
 | `server_port` | number | `8178` | Server 監聽埠，有效 1024~65535 |
@@ -217,6 +217,17 @@ Hammerspoon Console → hs.reload()
 
 可填入任何合法的 FFmpeg `-af` 參數。改動後用 Menubar → **Run Diagnostics**
 確認語法正確（診斷會以 `lavfi` 虛擬音源做 dry-run 驗證）。
+
+#### 關於 `max_context: 0`
+
+預設值 `0` 的理由是：PTT 錄的是獨立短句，不需要跨段上下文，關掉**理論上**
+可減少 whisper 的重複與拖尾幻覺。
+
+**這尚未經過真實 whisper.cpp 的 A/B 驗證**，不要當成已證實的最佳值。
+要驗證需要涵蓋 2–3 秒 / 5–15 秒 / 20–30 秒，中文、英文、中英混用、
+技術術語、口語自我修正等語料，比較 CER/WER、術語命中率、重複、
+拖尾幻覺與延遲。若你的實測結果不同，把它調回 whisper 預設即可
+（設為空字串或移除該欄位就不會帶 `-mc` 旗標）。
 
 ### 環境變數
 
@@ -237,6 +248,10 @@ Hammerspoon Console → hs.reload()
 | `WHISPER_SERVER` | `false` | `true` = 走 HTTP 推理（Lua 端會自動帶入）|
 | `WHISPER_SERVER_URL` | `http://127.0.0.1:8178` | whisper-server 位址 |
 | `WHISPER_SERVER_MODEL` | `""` | Server 載入的模型路徑，用來判斷能否走 server |
+
+「上次後端」的可能值：`⚡ server`、`📼 CLI`、`📦 快取（server 產生）`、
+`📦 快取（CLI 產生）`。快取命中會保留是哪個 backend 產生的，
+否則開了 server 又一直命中快取時，會看不出 server 到底有沒有在用。
 
 `WHISPER_CACHE` 與 `WHISPER_FALLBACK_MODEL` 不需手動設定 — Lua 端會依
 config.json 的 `cache_enabled` / `fallback_model` 自動帶入。
@@ -265,6 +280,22 @@ config.json 的 `cache_enabled` / `fallback_model` 自動帶入。
 
 ---
 
+## 🧪 測試
+
+```bash
+./tests/run.sh          # 全部
+./tests/run.sh 50 80    # 只跑編號開頭符合的
+```
+
+不需要真的 whisper.cpp、模型檔或 Hammerspoon —— 推理由 fake 提供。
+涵蓋模型解析、推理參數、VAD 降級、快取語意、server backend 的各種失敗路徑、
+幻覺過濾與異常輸入。詳見 [tests/README.md](tests/README.md)。
+
+> 這套測試**不驗證 Hammerspoon runtime**。Lua 只做靜態檢查。
+> 真機驗證清單見 [REAL_MAC_VALIDATION.md](REAL_MAC_VALIDATION.md)。
+
+---
+
 ## 🗂️ 檔案結構
 
 ```
@@ -274,10 +305,17 @@ ptt-whisper/
 ├── config_example.json          # 設定檔範例
 ├── hallucinations_builtin.txt   # 共用幻覺過濾列表（需部署到 ~/.ptt-whisper/）
 ├── CHANGELOG.md                 # 版本更新記錄
+├── REAL_MAC_VALIDATION.md       # 真機驗證清單（自動化測不到的部分）
 ├── LICENSE                      # MIT License
 ├── README.md
-└── docs/
-    └── ARCHITECTURE.md          # 管線與 ASR backend 契約
+├── docs/
+│   └── ARCHITECTURE.md          # 管線、ASR backend 契約、架構債
+└── tests/                       # 迴歸測試（不需要真的 whisper.cpp）
+    ├── run.sh
+    ├── cases/                   # 分主題的測試檔
+    ├── fakes/                   # fake whisper-cli / whisper-server
+    ├── fixtures/                # 測試用 WAV
+    └── lib/                     # 共用工具與靜態檢查
 ```
 
 ### 運行時產生的檔案（`~/.ptt-whisper/`）
@@ -418,6 +456,10 @@ CLI 模式每次放開按鍵都要重新載入模型——small 量化版約 0.3
 最後一項是刻意保守：占用該埠的行程載入的是哪個模型無從得知，直接沿用可能
 拿到錯的轉錄結果，所以寧可退回 CLI，由你決定要清掉它還是換 `server_port`。
 
+Server 的就緒判定用的是 `GET /health`：`200 + {"status":"ok"}` 才算就緒，
+`503` 代表行程活著但模型還在載入。**行程活著不等於模型可用**，所以載入
+期間的錄音會自動走 CLI。
+
 **怎麼確認它真的在用？** Menubar 會顯示「Server：就緒」與「上次後端：⚡ server」，
 Run Diagnostics 也有對應兩項。若 `server_mode` 開著但上次後端一直是
 📼 CLI，診斷會標成警告並要你看 Error Log——這條路徑會靜默降級，沒有這個
@@ -455,8 +497,8 @@ rm -rf ~/.ptt-whisper/cache/
 詳見 [CHANGELOG.md](CHANGELOG.md)
 
 **當前版本：**
-- `ptt_whisper.lua` v4.0.0
-- `transcribe.sh` v2.10.0
+- `ptt_whisper.lua` v4.0.1
+- `transcribe.sh` v2.10.1
 
 ---
 

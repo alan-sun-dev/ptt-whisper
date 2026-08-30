@@ -7,28 +7,81 @@
 
 ## 管線
 
+實際執行順序如下。層與層之間的擁有權（誰負責什麼）是這份文件的重點。
+
 ```
-按住熱鍵
-   │
-   ├─ ffmpeg 錄音（-af 聲學濾波器鏈）→ ptt_record.wav
-   │
-   ├─ [ ASR backend ] ──────────────── 唯一可替換的環節
-   │      輸入：16kHz 單聲道 wav + (language, prompt, max_context)
-   │      輸出：純文字，寫入 ${OUT_PREFIX}.txt
-   │
-   └─ 統一後處理（transcribe.sh）
-          ├─ sample rate 檢查 + 自動 resample
-          ├─ 快取查詢／寫入（key 含 audio hash + model + lang + 參數 variant）
-          ├─ fallback model 重試
-          ├─ clean_whisper_output（移除 whisper 特殊標記）
-          ├─ 幻覺過濾（內建 + 自訂，exact → normalized 兩層）
-          ├─ 重複標點檢查
-          └─ stdout → Lua → 剪貼簿 → 貼上（含 Secure Input 偵測與剪貼簿還原）
+Hotkey (Right Option)
+  │
+  ▼
+Audio Capture                        ptt_whisper.lua
+  └ ffmpeg -f avfoundation -af <聲學濾波器鏈> → ptt_record.wav
+  │
+  ▼
+Input validation                     transcribe.sh
+  ├ 檔案存在、大小 ≥ 1000 bytes
+  └ 環境變數型別／範圍驗證（逾時、max_context、cache 上限…）
+  │
+  ▼
+Capability & parameter resolution
+  ├ 模型解析（候選掃描或明確指定）
+  ├ whisper build 能力偵測（--prompt / --vad / -mc / -t），結果快取
+  ├ prompt 長度上限 + UTF-8 安全截斷
+  └ VAD 決策（auto / true / false × build 支援 × model 是否存在）
+  │
+  ▼
+Cache lookup ①                       key = audio hash + model + lang
+  └ 命中 → 直接輸出並結束                    + variant(prompt, VAD, max_context, backend)
+  │
+  ▼
+Pre-processing
+  ├ sample-rate 檢查（ffprobe）
+  └ 非 16kHz → 自動 resample
+  │
+  ▼
+ASR Dispatcher                       run_transcription()
+  ├ server backend   POST /inference   ← 優先，若 server_usable()
+  └ CLI backend      whisper-cli       ← 預設 / 退路
+  │
+  ▼
+Retry & fallback policy
+  ├ server 失敗 → Cache lookup ②（改用 CLI 的 identity）→ CLI backend
+  ├ VAD 失敗    → 關掉 VAD、同一主模型重試
+  └ 仍失敗      → fallback model
+  │
+  ▼
+Final transcript（純文字，${OUT_PREFIX}.txt）
+  │
+  ▼
+Text Pipeline                        統一、與 backend 無關
+  ├ cleanup（移除 whisper 特殊標記 [BLANK_AUDIO] 等）
+  ├ hallucination guard（exact → normalized 兩層）
+  ├ 重複標點檢查
+  ├ glossary                         ◇ planned extension point（尚未實作）
+  └ OpenCC 簡繁轉換                   ◇ planned extension point（尚未實作）
+  │
+  ▼
+Cache store                          用「實際完成推理的 backend」作 identity
+  │
+  ▼
+Output Adapter                       ptt_whisper.lua
+  ├ Secure Input 偵測（密碼框 → 中止）
+  ├ clipboard paste + 原剪貼簿還原
+  └ Unicode 直接輸入                  ◇ planned extension point（尚未實作）
 ```
 
-後處理不知道、也不需要知道是哪個 backend 跑的。
+◇ 標記的是**尚未實作**的延伸點，寫在這裡是為了標明它們未來屬於哪一層，
+不代表已經存在。
 
----
+### 幾個容易誤解的點
+
+- **Cache lookup 在 resample 之前。** hash 算的是原始音檔，所以命中時
+  連 resample 都可以整個跳過。這是刻意的。
+- **Fallback 屬於 inference orchestration，不是後處理。** 它決定「由誰產生
+  文字」，發生在文字產生之前。
+- **Cache identity 描述「實際完成推理的 backend」，不是「偏好」。**
+  preference 是 server 但實際降級到 CLI 時，結果寫進 CLI 的 namespace。
+- **Text Pipeline 之後的所有步驟都與 backend 無關。** 這是整個架構的重點：
+  換 backend 不該影響文字處理，新增文字處理不該要求每個 backend 各做一次。
 
 ## Backend 契約
 
@@ -98,3 +151,36 @@ git diff streaming-final HEAD -- ptt_whisper.lua # 移除了什麼
   經過管線後的輸出應與 CLI 一致（幻覺過濾與快取行為相同）。
 
 不滿足這些條件的實作，不應該併入 main。
+
+---
+
+## 已知架構債
+
+這些是明確記錄下來、但**刻意不在 v4.0.x 處理**的問題。
+
+### 1. 模型候選清單存在兩份
+
+`DEFAULT_MODEL_CANDIDATES` 在 `ptt_whisper.lua` 與 `transcribe.sh` 各有一份，
+註解要求「兩端保持一致」——需要靠註解維持的一致性就是漂移訊號。
+
+**方向**（尚未實作）：讓正常 Hammerspoon 路徑的模型選擇擁有者只有 Lua，
+由 Lua 解析出絕對路徑後傳給 `transcribe.sh`；`transcribe.sh` 保留自己的
+fallback 解析，但那條路徑只服務「在終端機直接執行」的場景。
+
+不在 v4.0.x 動的理由：現在改會同時影響兩個 entry point 的模型解析，
+風險大於收益，而目前兩份清單的內容有測試覆蓋（`tests/cases/10-*`）。
+
+### 2. 幻覺列表的 single source of truth 尚未完成
+
+目前有三份：repo 的 `hallucinations_builtin.txt`、Lua 的硬編碼 fallback、
+Bash 的硬編碼 fallback。後兩者是完整的 43 條複本。
+
+**方向**：解析順序改為
+runtime copy → repo copy → **最小**緊急 fallback（只留最常見的幾條），
+兩端都不再維護完整複本。
+
+### 3. `max_context: 0` 尚未經真實語料驗證
+
+預設值是理論推導（PTT 是獨立短句、關掉可減少重複與拖尾幻覺），
+但沒有跑過真實 whisper.cpp 的 A/B。保持 configurable，
+文件已明確標註尚待 benchmark。見 `REAL_MAC_VALIDATION.md` 第 30 項。

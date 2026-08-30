@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================
-# transcribe.sh v2.10.0 — PTT Whisper 轉錄腳本
+# transcribe.sh v2.10.1 — PTT Whisper 轉錄腳本
 #
-# 搭配 ptt_whisper.lua v3.8.0 使用
+# 搭配 ptt_whisper.lua v4.0.1 使用
 # 用法：transcribe.sh /path/to/audio.wav [language] [model_path]
 #   language   — 覆寫 WHISPER_LANG（如 en, zh, ja）
 #                空字串 "" 或 "auto" = 不帶 -l，讓 whisper.cpp 自行偵測
@@ -12,7 +12,12 @@
 #   prompt     — 覆寫 WHISPER_PROMPT（initial prompt，注入術語/人名）
 # 輸出：轉錄文字寫到 stdout（單行，去頭尾空白，含 trailing newline）
 #
-# v2.10.0 新增（常駐 server）：
+# v2.10.1 強化：
+#  H1.[Fix]   curl multipart 除音訊檔外一律用 --form-string（@ / < 字面值）
+#  H2.[Fix]   WHISPER_TIMEOUT 非數字會讓 (( )) 在 set -u 下中止腳本
+#  H3.[Fix]   快取 identity 改以「實際完成推理的 backend」為準
+#
+# v2.10.0（常駐 server）：
 #  SV1.[Feat]  支援 whisper-server：WHISPER_SERVER=true 時改用 HTTP 推理，
 #              省掉每次的模型載入。連不上／HTTP 非 200／回應不是純文字／
 #              模型與 server 不符 —— 任一情況都自動退回 CLI 路徑

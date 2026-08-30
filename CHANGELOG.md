@@ -5,6 +5,89 @@
 
 ---
 
+## [4.0.1] / transcribe.sh 2.10.1 — Hardening
+
+沒有新功能。這一版把 v3.8.0 引進的 server 路徑修到可以信任的程度，
+並把測試從「一次性 session 驗證」變成 repo 裡可重複執行的東西。
+
+### Fixed — Server readiness
+
+- **`GET /` + 「任何 HTTP 回應就算 ready」改為 `GET /health`。**
+  whisper-server 在模型載入完成前就會接受連線，原本的判定等於
+  「行程活著」，不等於「模型可用」——第一次錄音會打到還沒就緒的 server。
+  現在分成四類：`ready` / `loading`(503) / `foreign` / `unavailable`。
+
+- **占用偵測與就緒偵測拆成兩個函式。** 原本同一個布林值同時回答
+  「port 有沒有人在聽」與「模型能不能用」。占用偵測刻意把 404 之類的
+  回應也算成「被占用」——若改成「只有 200 才算」，回 404 的其他 HTTP
+  服務會被誤判成「port 是空的」，接著 bind 失敗。
+
+### Fixed — Stale callback race
+
+- **新增 `serverGeneration`。** start / stop / 非預期結束都會 +1，
+  所有非同步 callback 在排程時 capture 當下的 generation，不符就 return。
+
+  修掉的具體漏洞：舊 server 的 exit callback 會把新 server 的 `serverTask`
+  設成 nil（原本只檢查 `if serverTask then`）；`stopServer()` 之後在途的
+  readiness callback 仍會把 `serverReady` 設回 true；重複 restart 會累積
+  多個 poll loop。
+
+- `stopServer()` 先 bump generation 再 terminate，順序不能顛倒。
+
+### Fixed — Shutdown
+
+- 重啟由 `doAfter(0.5, startServer)`（睡半秒然後祈禱）改為
+  `waitForTaskExit()` 輪詢到行程真正結束，上限 5 秒，逾時記錄並照常啟動。
+  不做無條件強制 kill。
+
+### Fixed — Cache identity
+
+- **改以「實際完成推理的 backend」為準。** 原本用 `SERVER_MODE`，
+  那只是「希望用 server」；server 失敗退回 CLI 時，CLI 產生的結果仍被
+  寫進 server 的 namespace，下次 server 正常時就會拿到一份其實由 CLI
+  產生的結果。現在查詢用「預計的 backend」，真的降級時再用 CLI 的
+  identity 查第二次，寫入一律用實際的 backend。
+
+- 快取命中會把 `last_backend.txt` 寫成 `cache:server` / `cache:cli`，
+  Menubar 顯示「📦 快取（server 產生）」。
+
+### Fixed — 其他
+
+- **curl multipart 除音訊檔外一律 `--form-string`。** `-F` 會把值裡的
+  `@` 解讀成「上傳這個本機檔案」、`<` 解讀成「從檔案讀入內容」，
+  而 prompt 完全可能合法地以 `@` 或 `<` 開頭（`@channel`、`<tag>`）。
+  實測 `-F "prompt=@/tmp/x"` 會把 `/tmp/x` 的內容當欄位值送出去。
+
+- `WHISPER_TIMEOUT` 非數字時，`(( TIMEOUT_SEC > 0 ))` 會在 `set -u` 下
+  把它當變數名解析，直接 `unbound variable` 中止整個腳本。
+
+- `md5` / `md5sum` 都找不到時明確記錄「快取本次停用」，不再靜默跳過。
+
+### Added — 測試
+
+`./tests/run.sh`，**128 passed / 1 skipped**，不需要真的 whisper.cpp、
+模型或 Hammerspoon。涵蓋模型解析、推理參數、UTF-8 截斷、VAD 降級鏈、
+快取語意（含 backend identity 迴歸）、server 的六種失敗路徑、
+multipart 字面值安全、幻覺過濾、異常輸入、`/health` 六種情境。
+
+另跑靜態檢查：`bash -n`、JSON 合法性、Lua 區塊平衡，以及設定欄位在
+Lua 白名單 / README / `config_example.json` 三方的一致性。
+
+`tests/test-lua-units.lua` 從 `ptt_whisper.lua` 抽出
+`[TESTABLE:classifyHealthResponse]` 區塊直接執行——驗證的是實際出貨的
+程式碼。本機沒有 lua 直譯器時明確標示 skipped，不會假裝跑過。
+
+### Docs
+
+- `docs/ARCHITECTURE.md` 的管線圖修正順序：resample 在推理**前**、
+  cache lookup 也在推理前、fallback 屬於 inference orchestration 而非
+  後處理。未實作的 glossary / OpenCC / Unicode typing 標記為
+  ◇ planned extension point，不寫成已實作。新增「已知架構債」章節。
+- 新增 `REAL_MAC_VALIDATION.md`：30 項真機驗證清單。
+- README 明確標註 `max_context: 0` 是理論推導、**尚未經真實語料 A/B 驗證**。
+
+---
+
 ## [4.0.0] / transcribe.sh 2.10.0 — 移除 Streaming 模式
 
 **Breaking change。** Streaming 模式整套移除。
