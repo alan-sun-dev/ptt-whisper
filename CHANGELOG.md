@@ -5,6 +5,52 @@
 
 ---
 
+## [4.0.6] — 剪貼簿還原資料遺失
+
+### Fixed — 剪貼簿還原會吃掉多型別內容
+
+貼上語音轉錄後，原本複製的內容消失，`Cmd+V` 貼不出任何東西。
+
+`hs.pasteboard.writeDataForUTI(name, uti, data, add)` 的第 4 個參數 `add`
+**預設為 `false`**，也就是每次呼叫都會先清空剪貼簿再寫入。原本的還原迴圈
+沒有帶這個參數，跑完只剩下**最後一個** UTI。
+
+真機重現（模擬從文件複製，4 個型別）：
+
+```
+【現行】getContents() = nil
+【現行】剩下的 UTI = public.html        ← 只剩最後一個
+【修正】getContents() = 原本複製的重要內容-ABC123
+【修正】剩下的 UTI = 全部 4 個型別
+```
+
+單一型別的純文字剪貼簿不受影響（從終端機複製的內容能正常還原），
+只有從文件／網頁複製的多型別內容會被吃掉——所以很容易漏掉。
+
+修正：第一次寫入用 `add=false`（等同清空後寫入），之後一律 `add=true` 疊加。
+另加保險：若所有 UTI 都寫入失敗，至少把 `public.utf8-plain-text` 救回來，
+不要留下空的剪貼簿。
+
+新增 `tests/manual/clipboard-roundtrip.lua`。這一層無法納入 `run.sh`——
+它依賴 Hammerspoon 的 `hs.pasteboard`，而該模組只存在於 Hammerspoon runtime。
+
+### Diagnostics — 錄音
+
+0 bytes 錄音在改用「等 ffmpeg 真正結束」之後仍發生一次，但這次 ffmpeg
+**超過 2 秒沒回應 SIGINT**，遠超過實測的 0.7~0.9 秒——與先前三次是不同的
+狀況。手上沒有足夠資訊判斷原因（程式沒有記錄按鍵時長），因此先加診斷
+而不是再猜一次：
+
+```
+recording: 按住 16.23s
+recording: ffmpeg 已結束（SIGINT 後 0.47s）
+```
+
+同時把 0 bytes 的提示由技術訊息改為可操作的說明：
+「沒有錄到聲音，請按住久一點再說話」。
+
+---
+
 ## [4.0.5] — 真機聽寫實測抓到的問題
 
 實際按住熱鍵講話才會暴露的問題。前面所有自動化測試與 headless 驗證都無法觸及。

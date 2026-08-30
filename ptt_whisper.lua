@@ -1,6 +1,12 @@
 -- ============================================================
 -- Push-to-Talk Whisper Dictation for Hammerspoon
--- v4.0.5
+-- v4.0.6
+--
+-- v4.0.6 修正：
+--   CB1.[Fix]  剪貼簿還原會吃掉多型別內容 —— writeDataForUTI 的 add 參數
+--              預設 false，每次呼叫都先清空，迴圈跑完只剩最後一個 UTI
+--   DX1.[Diag] 錄音記錄按住時長與 ffmpeg 收尾耗時；0 bytes 的提示改為
+--              可操作的說明
 --
 -- v4.0.5 修正（真機聽寫實測抓到）：
 --   HK1.[Fix] Right Option 熱鍵完全沒反應 —— hs.hotkey 底層是 Carbon
@@ -64,7 +70,7 @@
 -- ============================================================
 
 -- ── 版本常數 ────────────────────────────────────────────────
-local VERSION = "4.0.5"
+local VERSION = "4.0.6"
 
 -- ── 設定區（Config）──────────────────────────────────────────
 
@@ -784,9 +790,31 @@ local function restoreClipboard(saved)
     hs.pasteboard.setContents(saved[1].data)
     return
   end
-  hs.pasteboard.clearContents()
+
+  -- [CB1] writeDataForUTI 的第 4 個參數 add 預設為 false，
+  -- 也就是「每次呼叫都先清空剪貼簿再寫入」。原本的迴圈沒帶這個參數，
+  -- 跑完只會剩下最後一個 UTI —— 從文件複製的多型別內容會被整個吃掉。
+  --
+  -- 真機實測（模擬從文件複製，4 個型別）：
+  --   不帶 add → getContents() = nil，只剩 public.html
+  --   帶 add   → getContents() 正確還原，4 個型別都在
+  --
+  -- 第一次寫入用 add=false（等同清空後寫入），之後一律 add=true 疊加。
+  local wrote = 0
   for _, entry in ipairs(saved) do
-    pcall(hs.pasteboard.writeDataForUTI, nil, entry.uti, entry.data)
+    local ok = pcall(hs.pasteboard.writeDataForUTI,
+                     nil, entry.uti, entry.data, wrote > 0)
+    if ok then wrote = wrote + 1 end
+  end
+  if wrote == 0 then
+    -- 一個型別都寫不回去：至少把純文字救回來，不要留下空的剪貼簿
+    appendErrorLog("restoreClipboard: 所有 UTI 都寫入失敗，改用純文字還原")
+    for _, entry in ipairs(saved) do
+      if entry.uti == "public.utf8-plain-text" then
+        pcall(hs.pasteboard.setContents, entry.data)
+        break
+      end
+    end
   end
 end
 
@@ -1418,9 +1446,12 @@ local function stopRecordingAndTranscribe()
   recordStartAt = nil
   -- [B3] 留住參照，稍後要等這個行程真正結束才檢查錄音檔
   local finishedRecordTask = recordTask
+  local killedAt = hs.timer.secondsSinceEpoch()
   killTask(finishedRecordTask)
   recordTask = nil
   playSound(SOUND_REC_STOP)
+
+  appendErrorLog(string.format("recording: 按住 %.2fs", duration))
 
   if duration < MIN_RECORD_SEC then
     currentState = STATE.IDLE
@@ -1444,8 +1475,11 @@ local function stopRecordingAndTranscribe()
 
     local valid, errMsg = isRecordFileValid()
     if not valid then
-      abortToIdle(errMsg, { log = "skipped: " .. errMsg,
-                            alert = "⚠️ " .. errMsg .. "，跳過轉錄" })
+      abortToIdle(errMsg, {
+        log = string.format("skipped: %s（按住 %.2fs）", errMsg, duration),
+        alert = "⚠️ 沒有錄到聲音，請按住久一點再說話",
+        alertDur = 2,
+      })
       return
     end
 
@@ -1543,6 +1577,9 @@ local function stopRecordingAndTranscribe()
   waitForTaskExit(finishedRecordTask,
     hs.timer.secondsSinceEpoch() + RECORD_EXIT_TIMEOUT_SEC,
     function(exited)
+      appendErrorLog(string.format(
+        "recording: ffmpeg %s（SIGINT 後 %.2fs）",
+        exited and "已結束" or "未結束", hs.timer.secondsSinceEpoch() - killedAt))
       if not exited then
         appendErrorLog(string.format(
           "ffmpeg 未在 %.1fs 內結束，仍嘗試讀取錄音檔", RECORD_EXIT_TIMEOUT_SEC))

@@ -80,6 +80,16 @@ opt-out 不只是視覺上跟完整通過不同，而是**機器可辨識**的�
 （含 `/sbin`），否則像「`md5` 找不到導致快取靜默失效」這種只在真實 runtime
 出現的 bug 永遠測不出來。
 
+## 需要 Hammerspoon 的手動測試
+
+`tests/manual/` 底下的腳本依賴 Hammerspoon runtime，無法納入 `run.sh`。
+
+| 腳本 | 驗證什麼 |
+|---|---|
+| `clipboard-roundtrip.lua` | 多型別剪貼簿的存／還原。`writeDataForUTI` 的 `add` 參數預設 false，每次呼叫都會清空剪貼簿——不帶這個參數的迴圈會把從文件複製的內容整個吃掉，而單一型別的純文字不會出事，所以很容易漏掉 |
+
+用法見各腳本開頭的註解。
+
 ## 尚未被測到的部分
 
 **這套測試驗證的是 `transcribe.sh` 與 Lua 的純函式，不是 Hammerspoon runtime。**
