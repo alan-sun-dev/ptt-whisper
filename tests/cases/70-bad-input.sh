@@ -28,8 +28,12 @@ if command -v ffprobe >/dev/null 2>&1 && command -v ffmpeg >/dev/null 2>&1; then
   out=$(t_run "FAKE_TEXT=resampled" -- "$TESTS/fixtures/silence-8k-1s.wav")
   assert_eq "8kHz 音訊 → 自動 resample 後仍成功" "$out" "resampled"
   assert_contains "log 記錄 resample" "$(t_log)" "16kHz"
+elif [[ "${ALLOW_MISSING:-0}" == "1" ]]; then
+  t_skip "8kHz 自動 resample" "ffmpeg/ffprobe 不在 PATH，且已明確 opt-out"
 else
-  t_skip "8kHz 自動 resample" "ffmpeg/ffprobe 不在 PATH"
+  # ffmpeg 是 PTT Whisper 本身的硬性依賴，不是測試專用工具。
+  # merge gate 要求 0 skipped，所以缺席時算失敗而非略過。
+  _t_bad "8kHz 自動 resample — ffmpeg/ffprobe 不在 PATH（brew install ffmpeg）"
 fi
 
 t_teardown; t_summary "G bad input"

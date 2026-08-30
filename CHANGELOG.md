@@ -5,6 +5,60 @@
 
 ---
 
+## [4.0.3] / transcribe.sh 2.10.1 — 測試套件的 merge-gate 語意
+
+### Changed
+
+- **`lua` 成為完整測試套件的必要依賴。** `./tests/run.sh` 在找不到 lua
+  直譯器時**失敗並回傳非零 exit code**，不再靜靜地 skip 然後報告成功。
+  理由：`classifyHealthResponse` 的實際出貨程式碼若沒有被執行，
+  整套 regression suite 不應被視為完整通過。
+
+- **統一規則：預設模式下任何 skip 都算失敗。** 旗標命名為
+  `PTT_TEST_ALLOW_MISSING_DEPS`（而非只針對 lua），因為 merge gate 的
+  實質要求是「0 skipped」，而 lua 不是唯一會造成 skip 的依賴——
+  `ffmpeg` / `ffprobe` 缺席時 8kHz resample 測試也會 skip。
+
+- **opt-out 是機器可辨識的，不只是視覺上不同。**
+  `PTT_TEST_ALLOW_MISSING_DEPS=1` 會印出醒目警告方塊，並在結尾輸出
+  純文字的 `RESULT: PARTIAL`（完整通過是 `RESULT: PASS`）。
+  exit code 維持 0——那是刻意的開發者選擇——但腳本可以 grep 出差別。
+
+### Fixed
+
+- **lua 存在但執行失敗時不再被當成通過。** 若直譯器崩潰（語法錯誤、
+  抽取失敗…），一條斷言都不會產出，而原本的實作會顯示「0 failed」——
+  看起來完全正常，實際上 43 條斷言一條都沒跑。這比「沒有 lua」更危險。
+  現在「有 lua 但產出 0 條斷言」是硬失敗，並印出直譯器輸出。
+
+- **`$VAR` 緊接非 ASCII 字元的寫法。** `"（exit=$lua_rc）"` 會讓 bash 把
+  全形括號的位元組吃進變數名，在 `set -u` 下直接 `unbound variable`
+  中止腳本。`bash -n` 抓不到這種問題，只有該行真的被執行時才會爆。
+  修掉發現的一處，並把掃描加成常駐靜態檢查
+  （`tests/lib/shell_var_scan.py`）。
+
+### Docs
+
+- `tests/README.md` 新增依賴表與 merge gate 語意說明。
+  明確寫出 `./tests/run.sh` = 完整 merge-gate 測試、
+  `PTT_TEST_ALLOW_MISSING_DEPS=1` = partial developer test only，
+  不足以作為合併依據。測試套件不會自動安裝任何依賴。
+
+### Testing
+
+`./tests/run.sh` → **181 passed, 0 failed, 0 skipped**（多一條靜態檢查）。
+
+四種情境都實測過：
+
+| 情境 | 結果 |
+|---|---|
+| 有 lua（正常） | `RESULT: PASS`，exit 0 |
+| 無 lua，預設 | `RESULT: FAIL`，exit 1，附安裝與 opt-out 指引 |
+| 無 lua，opt-out | `RESULT: PARTIAL`，exit 0，醒目警告方塊 |
+| 有 lua 但崩潰 | `RESULT: FAIL`，附直譯器輸出 |
+
+---
+
 ## [4.0.2] / transcribe.sh 2.10.1 — 嚴格 /health 分類
 
 ### Fixed

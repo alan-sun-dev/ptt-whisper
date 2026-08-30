@@ -46,20 +46,39 @@ probe error          500
 probe refused        000
 
 echo "    ── Lua classifyHealthResponse 分類驗證 ──"
-LUA_BIN=""
-for c in lua lua5.4 lua5.3 luajit; do
-  command -v "$c" >/dev/null 2>&1 && { LUA_BIN="$c"; break; }
-done
+LUA_BIN="${LUA_BIN:-}"
 if [[ -z "$LUA_BIN" ]]; then
-  t_skip "Lua 分類器單元測試" "本機沒有 lua 直譯器；安裝後 (brew install lua) 會自動執行"
-  echo "    ⚠️  REAL HAMMERSPOON TEST REQUIRED：readiness 分類尚未由直譯器驗證"
-else
-  if "$LUA_BIN" "$TESTS/test-lua-units.lua" "$REPO/ptt_whisper.lua" "$CAP" > "$T_DIR/luaout" 2>&1; then
-    while IFS= read -r line; do _t_ok "$line"; done < <(grep '^PASS ' "$T_DIR/luaout" | cut -d' ' -f2-)
+  for c in lua lua5.4 lua5.3 luajit; do
+    command -v "$c" >/dev/null 2>&1 && { LUA_BIN="$c"; break; }
+  done
+fi
+
+if [[ -z "$LUA_BIN" ]]; then
+  if [[ "${ALLOW_MISSING:-0}" == "1" ]]; then
+    t_skip "Lua 分類器單元測試" "無 lua 直譯器，且已明確 opt-out（本次不滿足 merge gate）"
   else
-    while IFS= read -r line; do _t_bad "$line"; done < <(grep '^FAIL ' "$T_DIR/luaout" | cut -d' ' -f2-)
-    while IFS= read -r line; do _t_ok  "$line"; done < <(grep '^PASS ' "$T_DIR/luaout" | cut -d' ' -f2-)
-    grep -qv '^\(PASS\|FAIL\) ' "$T_DIR/luaout" && cat "$T_DIR/luaout"
+    # merge gate：classifyHealthResponse 的實際出貨程式碼沒被執行，
+    # 就不能算通過。這不是可略過的項目。
+    _t_bad "Lua 分類器單元測試 — 找不到 lua 直譯器（brew install lua）"
+  fi
+else
+  "$LUA_BIN" "$TESTS/test-lua-units.lua" "$REPO/ptt_whisper.lua" "$CAP" \
+    > "$T_DIR/luaout" 2>&1
+  lua_rc=$?
+  n_assert=$(grep -c '^\(PASS\|FAIL\) ' "$T_DIR/luaout" 2>/dev/null || true)
+  n_assert="${n_assert:-0}"
+
+  if [[ "$n_assert" -eq 0 ]]; then
+    # 直譯器整個爆掉（語法錯誤、抽取失敗…）時，一條斷言都不會產出。
+    # 若不特別處理，這個 section 會顯示 0 failed —— 看起來完全正常，
+    # 但實際上 43 條斷言一條都沒跑。這比「沒有 lua」更危險。
+    _t_bad "Lua 單元測試沒有產出任何斷言（exit=${lua_rc}）— 直譯器或抽取失敗"
+    sed 's/^/        /' "$T_DIR/luaout" | head -20
+  else
+    while IFS= read -r line; do _t_ok  "$line"; done \
+      < <(grep '^PASS ' "$T_DIR/luaout" | cut -d' ' -f2-)
+    while IFS= read -r line; do _t_bad "$line"; done \
+      < <(grep '^FAIL ' "$T_DIR/luaout" | cut -d' ' -f2-)
   fi
 fi
 

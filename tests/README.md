@@ -1,11 +1,54 @@
 # 測試
 
 ```bash
-./tests/run.sh          # 全部
+./tests/run.sh          # 完整 merge-gate 測試
 ./tests/run.sh 50 80    # 只跑編號開頭符合的檔案
 ```
 
 不需要真的 whisper.cpp、模型檔或 Hammerspoon。所有推理都由 fake 提供。
+
+## 依賴
+
+完整 regression suite（= merge gate）需要：
+
+| 工具 | 用途 | 缺席時 |
+|---|---|---|
+| `bash` | 測試框架與 `transcribe.sh` | 無法執行 |
+| `python3` | fake server、靜態檢查工具 | 無法執行 |
+| `curl` | server backend 測試 | 無法執行 |
+| `lua` | 執行 `classifyHealthResponse` 的 43 條斷言 | **FAIL** |
+| `ffmpeg` / `ffprobe` | 8kHz 自動 resample 測試 | **FAIL** |
+
+macOS：
+
+```bash
+brew install lua ffmpeg
+```
+
+**測試套件不會自動幫你安裝任何東西**，只負責偵測並報錯。
+
+### merge gate 語意
+
+```bash
+./tests/run.sh
+```
+
+= **完整 merge-gate 測試**。要求 `0 failed` 且 `0 skipped`，結尾輸出
+`RESULT: PASS`。
+
+```bash
+PTT_TEST_ALLOW_MISSING_DEPS=1 ./tests/run.sh
+```
+
+= **partial developer test only，不足以作為合併依據**。容忍缺少
+`lua` / `ffmpeg` / `ffprobe`，印出醒目警告，結尾輸出 `RESULT: PARTIAL`。
+
+結尾那行 `RESULT: PASS|PARTIAL|FAIL` 刻意保持純文字，方便腳本 grep——
+opt-out 不只是視覺上跟完整通過不同，而是**機器可辨識**的不同。
+
+為什麼旗標是 `MISSING_DEPS` 而不是只針對 lua：merge gate 的實質要求是
+「0 skipped」，而 `lua` 不是唯一會造成 skip 的依賴（`ffmpeg` 也會）。
+一條統一規則比為每個依賴各開一個旗標清楚。
 
 ## 這套測試涵蓋什麼
 
@@ -21,7 +64,10 @@
 | `cases/80-health-scenarios.sh` | `/health` 六種情境的契約，以及 Lua readiness 分類器 |
 
 `run.sh` 另外會跑靜態檢查：`bash -n`、JSON 合法性、Lua 區塊平衡、
-以及設定欄位在 Lua 白名單 / README / `config_example.json` 三方的一致性。
+設定欄位在 Lua 白名單 / README / `config_example.json` 三方的一致性，
+以及 shell 檔案裡「`$VAR` 緊接非 ASCII 字元」的寫法
+（bash 會把多位元組字元吃進變數名，`bash -n` 抓不到，只在該行真的
+被執行時才爆）。
 
 ## Fakes
 

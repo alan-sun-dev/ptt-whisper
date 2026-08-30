@@ -18,7 +18,7 @@ test double；production 走的是 `hs.json.decode`。**這個替換本身沒有
 
 ## A. 載入與基本功能
 
-- [ ] 1. `hs.reload()` — Hammerspoon Console 無錯誤，出現「PTT Whisper v4.0.2 已載入」
+- [ ] 1. `hs.reload()` — Hammerspoon Console 無錯誤，出現「PTT Whisper v4.0.3 已載入」
 - [ ] 2. Menubar → **Run Diagnostics** — 18 個項目全部檢視，無非預期的 ❌
 - [ ] 3. 按住 Right Option 講話、放開 → 文字正確貼到游標處
 - [ ] 4. 貼上後原本的剪貼簿內容有被還原
