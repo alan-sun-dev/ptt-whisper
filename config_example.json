@@ -5,10 +5,6 @@
   },
   "show_preview_alert": true,
 
-  "streaming_mode": false,
-  "streaming_step_ms": 500,
-  "streaming_length_ms": 5000,
-
   "cache_enabled": false,
   "fallback_model": "ggml-tiny.bin",
 

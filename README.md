@@ -13,7 +13,6 @@
 
 - **Push-to-Talk 語音輸入** — 按住 Right Option 錄音，放開即轉錄貼上
 - **完全離線** — 使用本地 whisper.cpp 推理，資料不離開你的電腦
-- **Streaming 模式** ⚡ — 邊錄邊轉，體感延遲 < 0.5 秒（實驗性）
 - **多語言 / 多 App 切換** — 依前景 App 自動切換語言與模型
 - **術語注入** 🆕 — 用 initial prompt 餵入專有名詞、人名、中英混用詞，可依 App 疊加
 - **VAD 靜音偵測** 🆕 — 自動砍掉靜音段，加速推理並從源頭減少幻覺
@@ -23,7 +22,6 @@
 - **Fallback Model** — 主模型逾時或失敗時，自動用較小模型重試
 - **轉錄快取** — 相同音訊 + 模型 + 語言 = 直接回傳快取結果
 - **自動 Resample** — 非 16kHz 音訊自動轉換，免手動處理
-- **漸進式降級** — Streaming 連續失敗 N 次才永久切換傳統模式
 - **一鍵診斷** — Menubar → Run Diagnostics 檢查所有依賴
 - **Secure Input 偵測** — 偵測到密碼框自動中止貼上，保護安全
 
@@ -62,14 +60,6 @@ git clone https://github.com/ggml-org/whisper.cpp.git ~/whisper.cpp
 cd ~/whisper.cpp
 
 cmake -B build
-cmake --build build -j --config Release
-```
-
-若要使用 **Streaming 模式**（實驗性），改用以下建置指令（需要 SDL2）：
-
-```bash
-brew install sdl2
-cmake -B build -DWHISPER_SDL2=ON
 cmake --build build -j --config Release
 ```
 
@@ -178,10 +168,6 @@ Hammerspoon Console → hs.reload()
   },
   "show_preview_alert": true,
 
-  "streaming_mode": false,
-  "streaming_step_ms": 500,
-  "streaming_length_ms": 5000,
-
   "cache_enabled": false,
   "fallback_model": "ggml-tiny.bin",
 
@@ -210,9 +196,6 @@ Hammerspoon Console → hs.reload()
 |------|------|--------|------|
 | `slow_paste_apps` | object | 見上方 | 特定 App 的貼上延遲（秒），避免吃字 |
 | `show_preview_alert` | bool | `true` | 轉錄完成時是否顯示預覽 alert |
-| `streaming_mode` | bool | `false` | 啟用 Streaming 即時轉錄（實驗性）|
-| `streaming_step_ms` | number | `500` | Streaming 步長，有效 100~10000 |
-| `streaming_length_ms` | number | `5000` | Streaming 音訊窗口長度，有效 1000~30000 |
 | `cache_enabled` | bool | `false` | 啟用轉錄結果快取 |
 | `fallback_model` | string | `""` | Fallback 模型檔名或完整路徑 |
 | `audio_filter_chain` | string | 見下方 | 錄音時的 FFmpeg `-af` 濾波器鏈，設為 `""` 停用 |
@@ -234,7 +217,6 @@ Hammerspoon Console → hs.reload()
 
 可填入任何合法的 FFmpeg `-af` 參數。改動後用 Menubar → **Run Diagnostics**
 確認語法正確（診斷會以 `lavfi` 虛擬音源做 dry-run 驗證）。
-只對傳統模式生效 — Streaming 模式由 whisper.cpp 自行擷取麥克風，不經過 ffmpeg。
 
 ### 環境變數
 
@@ -261,6 +243,28 @@ config.json 的 `cache_enabled` / `fallback_model` 自動帶入。
 
 ---
 
+## 🏗️ 架構
+
+錄音之後，所有轉錄都走**同一條後處理管線**：
+
+```
+按住熱鍵 → ffmpeg 錄音 → [ ASR backend ] → 統一後處理 → 貼上
+                                              │
+                          resample · 幻覺過濾 · 標點檢查 · 快取 · fallback model
+```
+
+目前有兩個 ASR backend：**CLI**（每次執行 `whisper-cli`）與
+**server**（常駐 `whisper-server`）。兩者產出同一份純文字，後處理不需要
+區分是哪一條路徑跑的。
+
+> **v4.0.0 移除了 Streaming 模式。** 它是一條繞過上述管線的平行實作，
+> 因此幻覺過濾、快取、fallback model、prompt、VAD 都對它無效。
+> 未來要重做低延遲串流，必須以 backend 的形式接進這條管線——
+> 契約與理由見 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+> 最後一版實作保存在 `streaming-final` tag。
+
+---
+
 ## 🗂️ 檔案結構
 
 ```
@@ -271,7 +275,9 @@ ptt-whisper/
 ├── hallucinations_builtin.txt   # 共用幻覺過濾列表（需部署到 ~/.ptt-whisper/）
 ├── CHANGELOG.md                 # 版本更新記錄
 ├── LICENSE                      # MIT License
-└── README.md
+├── README.md
+└── docs/
+    └── ARCHITECTURE.md          # 管線與 ASR backend 契約
 ```
 
 ### 運行時產生的檔案（`~/.ptt-whisper/`）
@@ -417,14 +423,6 @@ Run Diagnostics 也有對應兩項。若 `server_mode` 開著但上次後端一�
 📼 CLI，診斷會標成警告並要你看 Error Log——這條路徑會靜默降級，沒有這個
 顯示你不會發現它其實沒生效。
 
-### Streaming 模式
-
-> ⚠️ 實驗性功能，需要 whisper.cpp build 支援 `--stream` 旗標
-
-在 `config.json` 中設定 `"streaming_mode": true`。Streaming 模式下 whisper.cpp 直接從麥克風擷取並即時轉錄，體感延遲從 2-3 秒降至 < 0.5 秒。
-
-限制：只能使用系統預設麥克風、不支援快取、大型模型延遲較高。
-
 ### 升級 whisper.cpp 後
 
 若啟用了快取，升級 whisper.cpp 或替換模型後建議清除快取：
@@ -442,7 +440,6 @@ rm -rf ~/.ptt-whisper/cache/
 | 聽到音效但沒有文字貼上 | Menubar → Run Diagnostics 檢查依賴 |
 | `❌ 找不到 ffmpeg` | `brew install ffmpeg` |
 | `❌ 麥克風權限被拒絕` | 系統設定 → 隱私權 → 麥克風 → 允許 Hammerspoon |
-| Streaming 模式不工作 | 確認 whisper.cpp build 含 SDL/PortAudio，執行 `whisper-cli --help` 確認有 `--stream` |
 | 轉錄結果是亂碼或英文 | 在 `lang_models` 中為該 App 指定正確語言 |
 | 貼上到 Slack/Teams 吃字 | 在 `slow_paste_apps` 中加大該 App 的延遲值 |
 | 專有名詞老是聽錯 | 在 `initial_prompt` 加入該詞彙，見「術語注入」|
@@ -458,7 +455,7 @@ rm -rf ~/.ptt-whisper/cache/
 詳見 [CHANGELOG.md](CHANGELOG.md)
 
 **當前版本：**
-- `ptt_whisper.lua` v3.8.0
+- `ptt_whisper.lua` v4.0.0
 - `transcribe.sh` v2.10.0
 
 ---

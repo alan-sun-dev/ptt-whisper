@@ -5,6 +5,71 @@
 
 ---
 
+## [4.0.0] / transcribe.sh 2.10.0 — 移除 Streaming 模式
+
+**Breaking change。** Streaming 模式整套移除。
+
+### Removed
+
+- `streaming_mode` / `streaming_step_ms` / `streaming_length_ms` 三個設定欄位
+- `startStreaming()` / `stopStreaming()` / `handleStreamingFailure()`、
+  stdout 累積器、`cleanStreamOutput()`、`STATE.STREAMING`、
+  以及只服務 streaming 的降級狀態機（`streamingFailCount`）
+- Diagnostics 的「`--stream` 支援」檢查
+- README 中的 SDL2 建置說明與 Streaming 章節
+
+共移除 271 行 Lua。`transcribe.sh` 不受影響（streaming 原本就完全繞過它），
+版本維持 2.10.0。
+
+### 為什麼
+
+Streaming 是一條**繞過統一後處理管線的平行實作**。它在 Lua 端自行組裝
+whisper 命令，不經過 `transcribe.sh`，因此：
+
+- resample、快取、fallback model 對它無效
+- 幻覺過濾必須在 Lua 端重複實作一份，兩份列表還得手動保持同步
+- v3.7.0 加的 `--prompt` 與 `--vad` 對它一樣無效
+- 它自帶一套只屬於自己的「連續失敗 N 次永久切換模式」狀態機
+
+每個加進管線的功能都得在 streaming 那邊再做一次，而它始終掛著「實驗性」。
+
+而 **v3.8.0 的常駐 server 已經用更穩定的機制達成了原本的目標**：
+streaming 想解決的是「每次錄音重新載入模型」的固定成本，server 把模型
+留在記憶體直接消除了它，且完整享有統一管線。
+
+### 保存
+
+最後一版實作保存於 git tag **`streaming-final`**：
+
+```bash
+git show streaming-final:ptt_whisper.lua
+git diff streaming-final HEAD -- ptt_whisper.lua
+```
+
+### 未來的串流必須是 ASR backend
+
+新增 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)，明訂管線與 backend 契約：
+任何語音辨識實作都必須以 backend 身分接進統一管線（只負責推理、產出純文字
+交給下游、失敗可降級、參數變動併入快取 key），**不得自建平行路徑**。
+
+若日後要重做低延遲串流：分段結果在 backend 內部累積，只在定稿時輸出一次；
+「邊講邊上螢幕」的即時預覽屬於 UI 層，讀 backend 的中間狀態來顯示，
+而不是繞過後處理直接寫入目標 App。
+
+### 升級須知
+
+舊的 `config.json` 留著 streaming 欄位不會壞。載入時會明確警告該欄位
+**已移除且不再有作用**（而非籠統的 "unknown config key"），
+Run Diagnostics 的「Config 驗證」項也看得到。可以安心刪掉那三行。
+
+### Changed
+
+- Diagnostics 標頭由 `Mode: Streaming/Traditional` 改為
+  `Backend: server/CLI`；Menubar 移除「模式」列（Server 與上次後端已涵蓋）
+- 啟動提示改顯示 backend 而非 mode
+
+---
+
 ## [3.8.0] / transcribe.sh 2.10.0 — 常駐 Server
 
 CLI 模式每次錄音都要重新載入模型（small 量化版約 0.3~0.5 秒）。這是與講話
