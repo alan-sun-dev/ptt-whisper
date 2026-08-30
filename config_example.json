@@ -5,15 +5,21 @@
   },
   "show_preview_alert": true,
 
-  "streaming_mode": false,
-  "streaming_step_ms": 500,
-  "streaming_length_ms": 5000,
-
   "cache_enabled": false,
   "fallback_model": "ggml-tiny.bin",
 
+  "audio_filter_chain": "highpass=f=200,lowpass=f=5000,loudnorm=I=-16:TP=-1.5",
+
+  "initial_prompt": "Kubernetes, Terraform, gRPC, PostgreSQL, code review, deploy",
+  "vad_enabled": "auto",
+  "max_context": -1,
+  "whisper_threads": 0,
+
+  "server_mode": false,
+  "server_port": 8178,
+
   "lang_models": {
-    "com.tinyspeck.slackmacgap":   { "lang": "en", "model": "ggml-small.en.bin" },
+    "com.tinyspeck.slackmacgap":   { "lang": "en", "model": "ggml-small.en.bin", "prompt": "standup, sprint, PR, rollback" },
     "com.microsoft.teams2":        { "lang": "en", "model": "ggml-small.en.bin" },
     "jp.naver.line.mac":           { "lang": "zh" },
     "_default":                    { "lang": "auto" }

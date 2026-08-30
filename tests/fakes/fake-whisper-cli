@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# 假的 whisper-cli：可設定能力集、可設定失敗條件，記錄收到的參數
+# 環境變數：
+#   FAKE_ARGLOG        參數記錄檔（每次執行 append 一行）
+#   FAKE_CAPS          --help 要宣告的能力，預設 "threads max-context prompt vad"
+#   FAKE_FAIL_ON_VAD   非空 → 帶 --vad 時 exit 3
+#   FAKE_FAIL_MODELS   空白分隔的 model basename，命中就 exit 4
+#   FAKE_TEXT          輸出文字，預設 "hello world"
+#   FAKE_ECHO_MODEL    非空 → 輸出 "from:<model basename>"
+set -u
+if [[ "${1:-}" == "--help" ]]; then
+  echo "usage: whisper-cli [options] file0 file1 ..."
+  echo "  -m FNAME,  --model FNAME"
+  echo "  -l LANG,   --language LANG"
+  echo "  -nt,       --no-timestamps"
+  echo "  -otxt,     --output-txt"
+  for cap in ${FAKE_CAPS-threads max-context prompt vad}; do
+    case "$cap" in
+      threads)     echo "  -t N,      --threads N" ;;
+      max-context) echo "  -mc N,     --max-context N" ;;
+      prompt)      echo "             --prompt PROMPT" ;;
+      vad)         echo "  -v,        --vad"; echo "  -vm FNAME, --vad-model FNAME" ;;
+    esac
+  done
+  exit 0
+fi
+
+printf '%s\n' "$*" >> "${FAKE_ARGLOG:-/dev/null}"
+
+of=""; model=""; prev=""
+for a in "$@"; do
+  [[ "$prev" == "-of" ]] && of="$a"
+  [[ "$prev" == "-m"  ]] && model="$a"
+  prev="$a"
+done
+mb=$(basename "${model:-none}")
+
+if [[ -n "${FAKE_FAIL_ON_VAD:-}" && "$*" == *"--vad"* ]]; then exit 3; fi
+for bad in ${FAKE_FAIL_MODELS:-}; do
+  [[ "$mb" == "$bad" ]] && exit 4
+done
+
+if [[ -n "${FAKE_ECHO_MODEL:-}" ]]; then
+  text="from:$mb"
+else
+  text="${FAKE_TEXT:-hello world}"
+fi
+
+echo "$text" > "$of.txt"
+
+# [B1] 真實的 whisper-cli 會「同時」把文字印到 stdout 和寫進 -otxt 檔案。
+# fake 之前只寫檔，所以「transcribe.sh 沒導掉 stdout 導致輸出重複」這個
+# bug 逃過了整套測試，直到真機驗證才被抓到。這裡忠實模擬。
+printf '\n %s\n' "$text"
+exit 0

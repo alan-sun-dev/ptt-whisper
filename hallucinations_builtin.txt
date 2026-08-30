@@ -1,0 +1,69 @@
+# ============================================================
+# PTT Whisper — 內建幻覺過濾列表（共用）
+#
+# whisper.cpp 在靜音或極短音訊上常會「幻覺」出訓練資料中的常見字幕句。
+# 本檔案由 ptt_whisper.lua 與 transcribe.sh 兩端共同載入，是唯一的真實來源。
+#
+# 安裝位置：~/.ptt-whisper/hallucinations_builtin.txt
+# 若此檔案不存在，兩端會各自退回硬編碼的 fallback 列表並在 log 留下 WARNING。
+#
+# 格式：一行一句；空行與 # 開頭的行會被忽略；每行前後空白自動 trim。
+# 比對方式為兩層：先原文精確比對，再 normalize（全形→半形、去尾標點、
+# 轉小寫）後比對，因此不需要為標點與大小寫變體重複列出。
+#
+# ⚠️ 請勿在此加入個人詞彙 — 那屬於 ~/.ptt-whisper/hallucinations.txt。
+# ⚠️ 修改此檔後，兩端的硬編碼 fallback 列表也應同步更新。
+# ============================================================
+
+# ── 英文 ──────────────────────────────────────────────
+Thank you.
+Thank you!
+Thank you
+Thanks.
+Thanks for watching.
+Thanks for watching!
+Thanks for listening.
+Thank you for watching.
+Thank you for watching!
+Thank you for listening.
+Please subscribe.
+Subscribe.
+Like and subscribe.
+Bye.
+Bye bye.
+Bye-bye.
+Goodbye.
+Good bye.
+
+# ── 純標點（靜音時的常見輸出）──────────────────────────
+...
+..
+.
+,
+
+# ── 字幕組署名 ────────────────────────────────────────
+Subtitles by the Amara.org community
+Subtitles by the Amara.org community.
+Sous-titres réalisés para la communauté d'Amara.org
+字幕由Amara.org社區提供
+
+# ── 日文 ──────────────────────────────────────────────
+ご視聴ありがとうございました
+ご視聴ありがとうございました。
+
+# ── 中文 ──────────────────────────────────────────────
+謝謝觀看
+謝謝觀看。
+謝謝觀看！
+謝謝收看
+謝謝收看。
+謝謝收聽
+謝謝收聽。
+謝謝
+謝謝。
+感謝觀看
+感謝觀看。
+請訂閱
+請訂閱。
+再見
+再見。

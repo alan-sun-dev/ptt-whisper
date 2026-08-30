@@ -1,13 +1,66 @@
 -- ============================================================
 -- Push-to-Talk Whisper Dictation for Hammerspoon
--- v3.6.4
+-- v4.0.7
 --
--- v3.6.4 修正（第四輪 Code Review）：
---   CR12.[Fix]  loadExternalConfig 結構化回傳（區分無檔/空檔/解析失敗）
---   CR13.[Fix]  streamingFailCount 改為漸進式衰減（成功 -1，非歸零）
---   CR14.[Feat] Diagnostics 區分 Q5_0 / FP16 模型標籤
---   CR15.[Feat] Diagnostics 新增濾波器鏈 dry-run 驗證
+-- v4.0.7 修正：
+--   CB2.[Fix] restoreClipboard 只檢查 pcall 的第一個回傳值，忽略了
+--             writeDataForUTI 自己回傳的成功／失敗 boolean。寫入失敗會被
+--             算成成功，導致 (1) 純文字 fallback 不會觸發、(2) 更嚴重的是
+--             後續寫入會用 add=true 疊加到殘留的轉錄文字上
 --
+-- v4.0.6 修正：
+--   CB1.[Fix]  剪貼簿還原會吃掉多型別內容 —— writeDataForUTI 的 add 參數
+--              預設 false，每次呼叫都先清空，迴圈跑完只剩最後一個 UTI
+--   DX1.[Diag] 錄音記錄按住時長與 ffmpeg 收尾耗時；0 bytes 的提示改為
+--              可操作的說明
+--
+-- v4.0.5 修正（真機聽寫實測抓到）：
+--   HK1.[Fix] Right Option 熱鍵完全沒反應 —— hs.hotkey 底層是 Carbon
+--             RegisterEventHotKey，不會對單獨按下的修飾鍵觸發。
+--             改用 hs.eventtap 監聽 flagsChanged
+--   B3.[Fix]  短按產生 0 bytes 錄音 —— ffmpeg 收到 SIGINT 後需要
+--             0.7~0.9 秒收尾，但 0.5s 就送 SIGTERM 打斷它、0.3s 就檢查檔案。
+--             改為等行程真正結束再檢查
+--
+-- v4.0.4 修正（真機驗證抓到的兩個 blocker）：
+--   B1.[Fix] CLI 路徑輸出重複 —— whisper-cli 同時印 stdout 與寫 -otxt，
+--            run_whisper 只導 stderr，導致文字被貼兩次（自初版就存在）
+--   B2.[Fix] max_context 預設由 0 改為 -1 —— -mc 0 會讓 initial_prompt
+--            完全失效，兩個 v3.7.0 的預設值互相抵銷
+--
+-- v4.0.3：測試套件的 merge-gate 語意（lua 成為必要依賴）
+--
+-- v4.0.2 強化：
+--   S1.[Fix]  /health 分類改用 JSON 解析，不再 substring 推斷
+--             （{"status_message":"ok"} 之類會被誤判成 ready）
+--   S2.[Fix]  occupancy 偵測不再重用 readiness 分類器，避免連帶收緊
+--
+-- v4.0.1 強化：
+--   H1.[Fix]  readiness 改用 GET /health（行程活著 ≠ 模型可用）
+--   H2.[Fix]  占用偵測與就緒偵測拆開，兩者語意不同
+--   H3.[Fix]  serverGeneration 守衛所有非同步 callback，消除 stale race
+--   H4.[Fix]  重啟改為等待舊行程真正結束，而非 sleep 固定秒數
+--   H5.[Fix]  快取 identity 改以「實際完成推理的 backend」為準
+--   H6.[Test] 加入 ./tests/run.sh 常駐迴歸測試套件
+--
+-- v4.0.0 移除（breaking）：
+--   RM1.[Remove] Streaming 模式整套移除。它是一條繞過統一後處理管線的
+--                平行實作，幻覺過濾／快取／fallback／prompt／VAD 對它皆無效。
+--                最後一版保存於 git tag `streaming-final`。
+--                未來的串流必須是統一管線下的 ASR backend，
+--                契約見 docs/ARCHITECTURE.md
+--
+-- v3.8.0（常駐 server）：
+--   SV1.[Feat] whisper-server 常駐模式，省掉每次錄音的模型載入成本
+--              預設關閉；任何失敗都自動退回 CLI 路徑
+--
+-- v3.7.0：P3（initial prompt、VAD、threads、max-context）、
+--         P3-1（PATH 補 /sbin，修好從未生效的快取）
+-- v3.6.5：MC1~MC2（模型候選掃描、WHISPER_CACHE_MAX 轉發）
+--
+-- 完整版本歷史見 CHANGELOG.md
+--
+-- v3.6.4：CR12~CR15（第四輪 Code Review）
 -- v3.6.3：CR7~CR11（第三輪 Code Review）
 -- v3.6.2：OPT1~OPT2（錄音品質 + 推理效能優化）
 -- v3.6.1：CR1~CR6（第二輪 Code Review）
@@ -19,11 +72,11 @@
 -- v3.0：E~K  v2.1：A~D
 --
 -- 使用方式：按住 Right Option 錄音，放開後自動轉錄並貼上
--- 依賴：ffmpeg、whisper.cpp 已編譯、~/ptt-whisper/transcribe.sh v2.8.4+
+-- 依賴：ffmpeg、whisper.cpp 已編譯、~/ptt-whisper/transcribe.sh v2.10.2+
 -- ============================================================
 
 -- ── 版本常數 ────────────────────────────────────────────────
-local VERSION = "3.6.4"
+local VERSION = "4.0.7"
 
 -- ── 設定區（Config）──────────────────────────────────────────
 
@@ -41,12 +94,52 @@ local BUILTIN_HALLUCINATION_FILE = PTT_DIR .. "/hallucinations_builtin.txt"
 local HOTKEY_MODS       = {}
 local HOTKEY_KEY        = "rightalt"
 
+-- ── [HK1] 修飾鍵熱鍵 ────────────────────────────────────────
+-- hs.hotkey 底層是 Carbon RegisterEventHotKey，它「不會」對單獨按下的修飾鍵
+-- 觸發——macOS 對修飾鍵送的是 flagsChanged 事件，不是 keyDown/keyUp。
+-- 真機驗證：按住 Right Option 完全沒反應，log 一行都沒有。
+-- 因此修飾鍵必須改用 hs.eventtap 監聽 flagsChanged。
+--
+-- mask 是 IOKit 的「裝置特定」修飾鍵遮罩（NX_DEVICE*KEYMASK），
+-- 用它才能分辨左右；hs.eventtap.event:getFlags() 的 alt/cmd/shift
+-- 不區分左右，左右同時按時會判斷錯誤。
+local MODIFIER_KEYCODES = {
+  rightalt   = { code = 61, mask = 0x40,   flag = "alt"   },
+  leftalt    = { code = 58, mask = 0x20,   flag = "alt"   },
+  rightcmd   = { code = 54, mask = 0x10,   flag = "cmd"   },
+  leftcmd    = { code = 55, mask = 0x08,   flag = "cmd"   },
+  rightshift = { code = 60, mask = 0x04,   flag = "shift" },
+  leftshift  = { code = 56, mask = 0x02,   flag = "shift" },
+  rightctrl  = { code = 62, mask = 0x2000, flag = "ctrl"  },
+  leftctrl   = { code = 59, mask = 0x01,   flag = "ctrl"  },
+}
+
+-- [TESTABLE:maskIsSet] ← tests/test-lua-units.lua 會抽出這段獨立執行
+--- 檢查 CGEventFlags 裡某個單一位元遮罩是否被設起來。
+--- 用除法+取餘而非位元運算子，避免相依於 Lua 版本（5.1 沒有 & 運算子）。
+--- @param flags number|nil  CGEventFlags 整數
+--- @param mask number       單一位元的遮罩（例如右 Option = 0x40）
+--- @return boolean
+local function maskIsSet(flags, mask)
+  if type(flags) ~= "number" or type(mask) ~= "number" or mask <= 0 then
+    return false
+  end
+  return math.floor(flags / mask) % 2 == 1
+end
+-- [/TESTABLE]
+
 -- 時間閾值
 local MIN_RECORD_SEC    = 0.3
 local MIN_FILE_BYTES    = 1000
-local FFMPEG_FLUSH_SEC  = 0.3
+-- [B3] ffmpeg 收到 SIGINT 後仍需時間寫完並收尾 WAV。真機實測需要
+-- 0.7~0.9 秒；這個值只是「行程結束後」再多留一點給檔案系統。
+local FFMPEG_FLUSH_SEC  = 0.15
+-- 等 ffmpeg 行程真正結束的上限
+local RECORD_EXIT_TIMEOUT_SEC = 3.0
 local PASTE_RESTORE_SEC = 0.6
-local KILL_FALLBACK_SEC = 0.5
+-- [B3] SIGINT 之後多久才升級成 SIGTERM。實測 ffmpeg 需要 0.7~0.9 秒收尾，
+-- 原本的 0.5 秒會在它寫完之前就把它砍掉，產生 0 bytes 的錄音檔。
+local KILL_FALLBACK_SEC = 2.0
 
 -- Log
 local MAX_LOG_SIZE      = 512 * 1024
@@ -82,22 +175,50 @@ local SLOW_PASTE_APPS = {
 -- 多語言 model 切換
 local LANG_MODELS = {}
 
--- ── [F5] Streaming 模式設定 ─────────────────────────────────
-local STREAMING_MODE     = false
-local STREAMING_STEP_MS  = 500     -- 每次處理的步長（ms），有效範圍 100~10000
-local STREAMING_LENGTH_MS = 5000   -- 每次處理的音訊窗口長度（ms），有效範圍 1000~30000
-
 -- ── [F4] 快取設定 ────────────────────────────────────────────
 local CACHE_ENABLED = false
 
 -- ── [F6] Fallback Model ─────────────────────────────────────
 local FALLBACK_MODEL = ""
 
--- ── [R6] Streaming fallback 漸進式降級 ──────────────────────
-local STREAMING_FALLBACK_THRESHOLD = 3
+-- ── [P3] 推理參數 ───────────────────────────────────────────
+-- initial prompt：注入術語 / 人名 / 中英混用詞，提升專有名詞辨識率。
+-- 全域 prompt 之後會再串接 lang_models[bid].prompt（見 getPromptForApp）。
+local INITIAL_PROMPT = ""
 
--- ── [P2] Streaming 累積上限（bytes）─────────────────────────
-local STREAM_ACCUMULATOR_MAX_BYTES = 65536  -- 64KB
+-- VAD：砍掉靜音段，短錄音提速明顯，也能從源頭減少靜音幻覺。
+-- "auto" = whisper.cpp 支援且找得到 VAD model 才啟用
+local VAD_ENABLED = "auto"
+
+-- max-context：-1 = 不帶此旗標，使用 whisper 自己的預設值。
+--
+-- [B2] 曾經預設為 0。真機 A/B 證實那會讓 initial_prompt 完全失效——
+-- -mc 0 清空 text context，而 initial prompt 的 token 就活在裡面。
+-- 兩者都是 v3.7.0 的預設值，互相抵銷。詳見 README「關於 max_context」。
+local MAX_CONTEXT = -1
+
+-- 執行緒數：0 = 交給 transcribe.sh 自動偵測（Apple Silicon 取效能核心數）
+local WHISPER_THREADS = 0
+
+-- ── [SV1] 常駐 whisper-server ───────────────────────────────
+-- CLI 模式每次錄音都要重新載入模型（small 約 0.3~0.5s）。常駐 server 把模型
+-- 留在記憶體，省掉這段固定成本。預設關閉：這會多一個長駐行程（約佔用一份
+-- 模型大小的 RAM），是否值得應該由使用者自己決定，不該升級後自動出現。
+local SERVER_MODE = false
+local SERVER_PORT = 8178
+local SERVER_HOST = "127.0.0.1"
+-- 模型載入可能要好幾秒，啟動後輪詢 /health 到就緒為止
+local SERVER_READY_TIMEOUT_SEC = 20
+local SERVER_POLL_INTERVAL_SEC = 0.4
+-- 重啟時等待舊行程真正結束的上限
+local SERVER_STOP_TIMEOUT_SEC  = 5
+
+local WHISPER_SERVER_BIN_CANDIDATES = {
+  "/build/bin/whisper-server",
+  "/whisper-server",
+  "/build/bin/server",
+  "/server",
+}
 
 -- ── [P6] Whisper binary 搜尋路徑（與 transcribe.sh 保持一致）──
 local WHISPER_BIN_CANDIDATES = {
@@ -107,17 +228,40 @@ local WHISPER_BIN_CANDIDATES = {
   "/build/bin/main",
 }
 
+-- ── [MC1] 預設模型候選清單（與 transcribe.sh 保持一致）──────
+-- 量化版優先：速度 2~3x、RAM 減半、準確率幾乎無損（<0.5% WER 差異）。
+-- q5_1 排在 q5_0 之前：whisper.cpp 的 download-ggml-model.sh 對 small
+-- 只提供 q5_1（q5_0 僅 medium/large 有），q5_0 需自行 quantize。
+local DEFAULT_MODEL_CANDIDATES = {
+  "ggml-small-q5_1.bin",
+  "ggml-small-q5_0.bin",
+  "ggml-small-q8_0.bin",
+  "ggml-small.bin",
+}
+
 -- ── [CR3] Config 已知欄位白名單 ─────────────────────────────
 local CONFIG_KNOWN_KEYS = {
   slow_paste_apps = true,
   show_preview_alert = true,
-  streaming_mode = true,
-  streaming_step_ms = true,
-  streaming_length_ms = true,
   cache_enabled = true,
   fallback_model = true,
   lang_models = true,
   audio_filter_chain = true,
+  initial_prompt = true,
+  vad_enabled = true,
+  max_context = true,
+  whisper_threads = true,
+  server_mode = true,
+  server_port = true,
+}
+
+-- ── [RM1] 已移除的設定欄位 ─────────────────────────────────
+-- 舊 config.json 留著這些欄位不會壞，但要明確告訴使用者它們已經沒有作用，
+-- 而不是用一句籠統的 "unknown config key" 帶過。
+local REMOVED_CONFIG_KEYS = {
+  streaming_mode      = "Streaming 模式已於 v4.0.0 移除",
+  streaming_step_ms   = "Streaming 模式已於 v4.0.0 移除",
+  streaming_length_ms = "Streaming 模式已於 v4.0.0 移除",
 }
 
 -- ── [CR3] Config 驗證：集中處理型別、範圍、預設值 ────────────
@@ -131,9 +275,13 @@ local function validateConfig(config)
     print("[PTT Whisper] WARNING: " .. msg)
   end
 
-  -- Unknown keys
+  -- Unknown / removed keys
   for key, _ in pairs(config) do
-    if not CONFIG_KNOWN_KEYS[key] then
+    if REMOVED_CONFIG_KEYS[key] then
+      warn(string.format("config key '%s' 已移除且不再有作用：%s"
+        .. "（見 CHANGELOG.md 與 docs/ARCHITECTURE.md）",
+        key, REMOVED_CONFIG_KEYS[key]))
+    elseif not CONFIG_KNOWN_KEYS[key] then
       warn(string.format("unknown config key '%s' (ignored)", key))
     end
   end
@@ -179,42 +327,15 @@ local function validateConfig(config)
           if type(entry.model) == "string" and entry.model ~= "" then
             parsed.model = entry.model
           end
-          if parsed.lang or parsed.model then
+          -- [P3] per-app prompt：會接在全域 initial_prompt 之後
+          if type(entry.prompt) == "string" and entry.prompt ~= "" then
+            parsed.prompt = entry.prompt
+          end
+          if parsed.lang or parsed.model or parsed.prompt then
             LANG_MODELS[bid] = parsed
           end
         end
       end
-    end
-  end
-
-  -- streaming_mode: boolean
-  if config.streaming_mode ~= nil then
-    if type(config.streaming_mode) == "boolean" then
-      STREAMING_MODE = config.streaming_mode
-    else
-      warn("streaming_mode: expected boolean")
-    end
-  end
-
-  -- streaming_step_ms: number, 100~10000 (ms)
-  if config.streaming_step_ms ~= nil then
-    if type(config.streaming_step_ms) == "number"
-       and config.streaming_step_ms >= 100
-       and config.streaming_step_ms <= 10000 then
-      STREAMING_STEP_MS = config.streaming_step_ms
-    elseif type(config.streaming_step_ms) == "number" then
-      warn("streaming_step_ms out of range (100~10000 ms)")
-    end
-  end
-
-  -- streaming_length_ms: number, 1000~30000 (ms)
-  if config.streaming_length_ms ~= nil then
-    if type(config.streaming_length_ms) == "number"
-       and config.streaming_length_ms >= 1000
-       and config.streaming_length_ms <= 30000 then
-      STREAMING_LENGTH_MS = config.streaming_length_ms
-    elseif type(config.streaming_length_ms) == "number" then
-      warn("streaming_length_ms out of range (1000~30000 ms)")
     end
   end
 
@@ -245,6 +366,74 @@ local function validateConfig(config)
       end
     else
       warn("audio_filter_chain: expected string")
+    end
+  end
+
+  -- [P3] initial_prompt: string
+  if config.initial_prompt ~= nil then
+    if type(config.initial_prompt) == "string" then
+      INITIAL_PROMPT = config.initial_prompt
+    else
+      warn("initial_prompt: expected string")
+    end
+  end
+
+  -- [P3] vad_enabled: boolean 或 "auto"
+  if config.vad_enabled ~= nil then
+    if type(config.vad_enabled) == "boolean" then
+      VAD_ENABLED = config.vad_enabled and "true" or "false"
+    elseif config.vad_enabled == "auto" then
+      VAD_ENABLED = "auto"
+    else
+      warn("vad_enabled: expected boolean or \"auto\"")
+    end
+  end
+
+  -- [P3][B2] max_context: number, -1~224
+  --   -1  = 不帶 -mc，使用 whisper 預設（推薦，才不會讓 initial_prompt 失效）
+  --   0~224 = 明確指定
+  if config.max_context ~= nil then
+    if type(config.max_context) == "number"
+       and config.max_context >= -1
+       and config.max_context <= 224 then
+      MAX_CONTEXT = math.floor(config.max_context)
+      if MAX_CONTEXT == 0 and INITIAL_PROMPT ~= "" then
+        warn("max_context=0 會讓 initial_prompt 完全失效（-mc 0 清空 text "
+             .. "context，prompt token 就在裡面）。若要用術語注入請改為 -1 或 >0")
+      end
+    else
+      warn("max_context: expected number in -1~224 (-1 = whisper 預設)")
+    end
+  end
+
+  -- [P3] whisper_threads: number, 0~16（0 = 自動偵測）
+  if config.whisper_threads ~= nil then
+    if type(config.whisper_threads) == "number"
+       and config.whisper_threads >= 0
+       and config.whisper_threads <= 16 then
+      WHISPER_THREADS = math.floor(config.whisper_threads)
+    else
+      warn("whisper_threads: expected number in 0~16 (0 = auto)")
+    end
+  end
+
+  -- [SV1] server_mode: boolean
+  if config.server_mode ~= nil then
+    if type(config.server_mode) == "boolean" then
+      SERVER_MODE = config.server_mode
+    else
+      warn("server_mode: expected boolean")
+    end
+  end
+
+  -- [SV1] server_port: number, 1024~65535
+  if config.server_port ~= nil then
+    if type(config.server_port) == "number"
+       and config.server_port >= 1024
+       and config.server_port <= 65535 then
+      SERVER_PORT = math.floor(config.server_port)
+    else
+      warn("server_port: expected number in 1024~65535")
     end
   end
 
@@ -302,7 +491,6 @@ local STATE = {
   IDLE         = "idle",
   RECORDING    = "recording",
   TRANSCRIBING = "transcribing",
-  STREAMING    = "streaming",
   PASTING      = "pasting",
 }
 local currentState = STATE.IDLE
@@ -311,14 +499,9 @@ local sessionCounter = 0
 -- 模組級引用
 local recordTask       = nil
 local transcribeTask   = nil
-local streamTask       = nil
 local recordStartAt    = nil
 local cachedFFmpegPath = nil
-local streamChunks     = {}
-local streamChunksSize = 0
 local killFallbackTimer = nil
-local streamingFailCount = 0
-local streamingModeUserSetting = STREAMING_MODE
 
 -- ── Menubar ─────────────────────────────────────────────────
 local menubarItem = hs.menubar.new()
@@ -465,8 +648,8 @@ local function findWhisperBin()
 end
 
 --- 解析 model 路徑
---- [OPT2] 預設優先使用 Q5_0 量化版（速度 2~3x, RAM -50%, 準確率幾乎無損）
----        若 Q5_0 不存在則自動 fallback 到原始 FP16 版本
+--- [MC1] 未指定 model 時，依 DEFAULT_MODEL_CANDIDATES 順序掃描：
+---        量化版（q5_1 → q5_0 → q8_0）優先，全都沒有才用 FP16
 local function resolveModelPath(modelName)
   local whisperDir = os.getenv("WHISPER_DIR")
                      or (os.getenv("HOME") .. "/whisper.cpp")
@@ -477,14 +660,17 @@ local function resolveModelPath(modelName)
     if envModel then
       path = envModel
     else
-      -- [OPT2] 優先 Q5_0，fallback 到 FP16
-      local q5Path = whisperDir .. "/models/ggml-small-q5_0.bin"
-      local fpPath = whisperDir .. "/models/ggml-small.bin"
-      if hs.fs.attributes(q5Path) then
-        path = q5Path
-      else
-        path = fpPath
+      -- [MC1] 依偏好順序掃描候選模型，量化版優先
+      for _, name in ipairs(DEFAULT_MODEL_CANDIDATES) do
+        local candidate = whisperDir .. "/models/" .. name
+        if hs.fs.attributes(candidate) then
+          path = candidate
+          break
+        end
       end
+      -- 全部候選皆不存在時仍指向 FP16 路徑，
+      -- 讓下方的存在性檢查回傳 nil、由呼叫端輸出明確錯誤
+      path = path or (whisperDir .. "/models/ggml-small.bin")
     end
   elseif modelName:sub(1, 1) == "/" then
     path = modelName
@@ -558,17 +744,31 @@ local function getPasteDelay()
   return PASTE_RESTORE_SEC
 end
 
---- 根據前景 app 取得語言/模型
+--- 根據前景 app 取得語言/模型/prompt
+--- @return string|nil lang, string|nil model, string appName, string|nil prompt
 local function getLangModelForCurrentApp()
   local ok, app = pcall(hs.application.frontmostApplication)
-  if not ok or not app then return nil, nil, "(unknown)" end
+  if not ok or not app then return nil, nil, "(unknown)", nil end
   local bid = app:bundleID() or ""
   local appName = app:name() or bid
   local entry = LANG_MODELS[bid] or LANG_MODELS["_default"]
-  if not entry then return nil, nil, appName end
+  if not entry then return nil, nil, appName, nil end
   local lang = entry.lang
   if lang == "auto" then lang = nil end
-  return lang, entry.model, appName
+  return lang, entry.model, appName, entry.prompt
+end
+
+--- [P3] 組出這次要用的 initial prompt
+--- 全域 initial_prompt 是通用術語表（你的名字、公司、常用中英混用詞），
+--- per-app prompt 是該 App 的領域術語 —— 兩者「串接」而非互相覆蓋，
+--- 這樣全域術語表在每個 App 都有效，不必逐個 App 重複貼一遍。
+--- @param appPrompt string|nil
+--- @return string  空字串 = 不帶 --prompt
+local function buildPrompt(appPrompt)
+  local parts = {}
+  if INITIAL_PROMPT ~= "" then table.insert(parts, INITIAL_PROMPT) end
+  if appPrompt and appPrompt ~= "" then table.insert(parts, appPrompt) end
+  return table.concat(parts, " ")
 end
 
 PTTWhisper.getLangModelForCurrentApp = getLangModelForCurrentApp
@@ -590,16 +790,432 @@ local function saveClipboard()
   return saved
 end
 
+-- [TESTABLE:restoreClipboardEntries] ← tests/test-lua-units.lua 會抽出這段獨立執行
+--- 把存下的剪貼簿內容逐一寫回。純函式：writer 由外部注入，不依賴 hs。
+---
+--- [CB2] pcall 的第一個回傳值只代表「沒有 throw」。writeDataForUTI 另外會
+--- 回傳 boolean 表示是否真的寫入成功，兩者都必須檢查。只看 pcall 的話，
+--- 寫入失敗仍會被算成功，後果有兩層：
+---   1. wrote 永遠 > 0，純文字 fallback 不會被觸發
+---   2. 更嚴重：第一筆失敗卻被計入時，第二筆會用 add=true，而此時剪貼簿上
+---      還是語音轉錄的文字（沒有任何一次成功的 add=false 清空過它），
+---      於是把使用者的原始內容「疊加」到轉錄文字上，而不是取代它
+---
+--- 因此 add 的依據必須是「已成功寫入幾筆」，不能用迴圈索引。
+---
+--- @param entries table  { { uti = string, data = any }, ... }
+--- @param writeFn function(uti, data, add) -> boolean
+--- @return number  成功寫入的型別數
+local function restoreClipboardEntries(entries, writeFn)
+  local wrote = 0
+  for _, entry in ipairs(entries) do
+    local callOk, writeOk = pcall(writeFn, entry.uti, entry.data, wrote > 0)
+    if callOk and writeOk then
+      wrote = wrote + 1
+    end
+  end
+  return wrote
+end
+-- [/TESTABLE]
+
 local function restoreClipboard(saved)
   if not saved or #saved == 0 then return end
   if #saved == 1 and saved[1].uti == "__plaintext_fallback__" then
     hs.pasteboard.setContents(saved[1].data)
     return
   end
-  hs.pasteboard.clearContents()
-  for _, entry in ipairs(saved) do
-    pcall(hs.pasteboard.writeDataForUTI, nil, entry.uti, entry.data)
+
+  -- [CB1] writeDataForUTI 的第 4 個參數 add 預設為 false，也就是「每次呼叫
+  -- 都先清空剪貼簿再寫入」。不帶這個參數的迴圈跑完只會剩下最後一個 UTI，
+  -- 從文件複製的多型別內容會被整個吃掉。
+  local wrote = restoreClipboardEntries(saved, function(uti, data, add)
+    return hs.pasteboard.writeDataForUTI(nil, uti, data, add)
+  end)
+
+  if wrote == 0 then
+    -- 一個型別都寫不回去：至少把純文字救回來，不要留下空的剪貼簿
+    appendErrorLog("restoreClipboard: 所有 UTI 都寫入失敗，改用純文字還原")
+    for _, entry in ipairs(saved) do
+      if entry.uti == "public.utf8-plain-text" then
+        pcall(hs.pasteboard.setContents, entry.data)
+        break
+      end
+    end
   end
+end
+
+-- ── [SV1] whisper-server 生命週期 ───────────────────────────
+-- 狀態不變式：
+--   serverGeneration —— 每次 start / stop / 非預期結束都會 +1。
+--                       所有非同步 callback（process exit、health 探測、
+--                       poll timer、restart 等待）都在排程時 capture 當下的
+--                       generation，觸發時若已不相符就直接 return，
+--                       絕不碰任何 server 全域狀態。
+--   serverTask       —— 目前這一代的行程；nil = 沒有我們啟動的 server
+--   serverReady      —— /health 回報模型已載入完成（不只是「port 有回應」）
+--   serverStatusText —— 永遠對應「目前 generation」的狀態
+local serverTask       = nil
+local serverReady      = false
+local serverModelPath  = nil
+local serverStatusText = "未啟用"
+local serverGeneration = 0
+
+local function bumpGeneration()
+  serverGeneration = serverGeneration + 1
+  return serverGeneration
+end
+
+local function serverBaseURL()
+  return string.format("http://%s:%d", SERVER_HOST, SERVER_PORT)
+end
+
+--- 找 whisper-server 執行檔（與 findWhisperBin 同樣的搜尋策略）
+local function findWhisperServerBin()
+  local whisperDir = os.getenv("WHISPER_DIR")
+                     or (os.getenv("HOME") .. "/whisper.cpp")
+  for _, suffix in ipairs(WHISPER_SERVER_BIN_CANDIDATES) do
+    local path = whisperDir .. suffix
+    local attr = hs.fs.attributes(path)
+    if attr and attr.mode == "file" then return path end
+  end
+  return nil
+end
+
+-- [TESTABLE:classifyHealthResponse] ← tests/test-lua-units.lua 會抽出這段獨立執行
+--- 把 GET /health 的結果分類。純函式，不碰任何全域狀態。
+---
+--- whisper.cpp server 的正式契約：
+---   ready   HTTP 200  {"status":"ok"}
+---   loading HTTP 503  {"status":"loading model"}
+---
+--- 決策表：
+---   連線失敗（status nil 或 < 100）                    → "unavailable"
+---   200 + 合法 JSON object + status == "ok"            → "ready"
+---   503 + 合法 JSON object + status == "loading model" → "loading"
+---   其他一切（含 200 非 JSON、200 無關 JSON、
+---            503 無關 JSON、404、500…）                → "foreign"
+---
+--- 刻意不做 substring 判斷：像 {"status_message":"not ok"} 或純文字
+--- "status check ok" 都同時含有 status 與 ok，會造成 false-positive ready。
+---
+--- 關鍵區分：
+---   「行程活著」（loading / foreign）  ≠  「模型可用」（ready）
+---   「port 空著」（unavailable）      ≠  「port 被別的服務占用」（foreign）
+---
+--- @param status number|nil  HTTP status；nil 或 < 100 代表連線失敗
+--- @param body string|nil    回應內容
+--- @param decode function|nil JSON decoder，預設 hs.json.decode。
+---        參數化的唯一目的：讓 tests/test-lua-units.lua 能在沒有 Hammerspoon
+---        的環境下直接執行「這一份」程式碼，而不是複製一份實作去測。
+--- @return string state, string detail
+local function classifyHealthResponse(status, body, decode)
+  if status == nil or status < 100 then
+    return "unavailable", "connection failed"
+  end
+
+  local detail = (body or ""):sub(1, 120)
+
+  -- 只有 200 與 503 在契約內，其餘一律 foreign（有東西在聽，但不是 whisper-server）
+  if status ~= 200 and status ~= 503 then
+    return "foreign", "HTTP " .. tostring(status)
+  end
+
+  decode = decode or (rawget(_G, "hs") and hs.json and hs.json.decode)
+  if not decode then
+    return "foreign", "no JSON decoder available"
+  end
+
+  -- hs.json.decode 遇到非法 JSON 會 raise error（不是回傳 nil），必須包 pcall
+  local parsed
+  local ok
+  ok, parsed = pcall(decode, body or "")
+  if not ok or type(parsed) ~= "table" then
+    return "foreign",
+      "HTTP " .. tostring(status) .. " body 不是合法 JSON object: " .. detail
+  end
+
+  -- 陣列在 Lua 裡也是 table，所以「是 table」不夠；status 必須是字串
+  local st = parsed.status
+  if type(st) ~= "string" then
+    return "foreign",
+      "HTTP " .. tostring(status) .. " JSON 沒有 status 字串: " .. detail
+  end
+
+  if status == 200 and st == "ok" then
+    return "ready", detail
+  end
+  if status == 503 and st == "loading model" then
+    return "loading", detail
+  end
+  return "foreign",
+    "HTTP " .. tostring(status) .. " status=\"" .. st .. "\""
+end
+-- [/TESTABLE]
+
+--- Readiness 探測：專門回答「whisper 模型能不能用」
+--- @param callback function(state: string, detail: string)
+local function probeServerReadiness(callback)
+  hs.http.asyncGet(serverBaseURL() .. "/health", nil, function(status, body)
+    callback(classifyHealthResponse(status, body))
+  end)
+end
+
+--- Endpoint 占用探測：專門回答「這個 port 上是不是已經有東西在聽」
+--- 與 readiness 刻意分開：任何 HTTP 回應（含 404、500）都代表被占用，
+--- 不能因為 /health 回 404 就誤判成「port 是空的」而去啟動並 bind 失敗。
+--- @param callback function(occupied: boolean, detail: string)
+local function probeEndpointOccupancy(callback)
+  hs.http.asyncGet(serverBaseURL() .. "/health", nil, function(status)
+    -- 任何 HTTP 回應（含 404 / 500 / 非 JSON）都代表 port 上有人在聽。
+    -- 這裡刻意「不」重用 classifyHealthResponse：readiness 收緊成
+    -- 「必須是 whisper-server 的 JSON 契約」之後，若 occupancy 跟著收緊，
+    -- 回 404 的其他 HTTP 服務就會被誤判成「port 是空的」，
+    -- 接著我們啟動 whisper-server 並 bind 失敗。兩者語意必須各自獨立。
+    local occupied = (status ~= nil and status >= 100)
+    callback(occupied, occupied and ("HTTP " .. tostring(status)) or "no listener")
+  end)
+end
+
+--- 停止 server。先 bump generation，讓所有在途 callback 立刻失效，
+--- 再終止行程 —— 順序不能顛倒，否則 terminate 觸發的 exit callback
+--- 會用舊 generation 通過檢查。
+--- @return userdata|nil 被停掉的 task（供 restart 等待其真正結束）
+local function stopServer(statusText)
+  bumpGeneration()
+  local task = serverTask
+  serverTask      = nil
+  serverReady     = false
+  serverModelPath = nil
+  serverStatusText = statusText or "已停止"
+  if task then
+    pcall(function()
+      if task:isRunning() then task:terminate() end
+    end)
+  end
+  return task
+end
+
+--- 等待行程真正結束（而不是 sleep 固定秒數然後祈禱）
+local function waitForTaskExit(task, deadline, callback)
+  if not task then callback(true); return end
+  local running = false
+  pcall(function() running = task:isRunning() end)
+  if not running then callback(true); return end
+  if hs.timer.secondsSinceEpoch() >= deadline then callback(false); return end
+  hs.timer.doAfter(SERVER_POLL_INTERVAL_SEC, function()
+    waitForTaskExit(task, deadline, callback)
+  end)
+end
+
+--- 偵測效能核心數（與 transcribe.sh 的策略一致）
+local function detectPerfCores()
+  local out = runCommandSync("/usr/sbin/sysctl", {"-n", "hw.perflevel0.physicalcpu"})
+  local n = tonumber((out or ""):match("%d+"))
+  if not n then
+    out = runCommandSync("/usr/sbin/sysctl", {"-n", "hw.physicalcpu"})
+    n = tonumber((out or ""):match("%d+"))
+  end
+  if not n or n < 1 then n = 4 end
+  if n > 16 then n = 16 end
+  return n
+end
+
+local startServer  -- forward declaration（restart 會用到）
+
+--- 輪詢 /health 直到模型就緒，或超過 deadline。
+--- gen 是這一代的 generation；每個進入點與 callback 都先比對，
+--- 不相符就結束 —— 這同時保證「重複 restart 不會累積多個 poll loop」。
+local function pollUntilReady(gen, deadline)
+  if gen ~= serverGeneration then return end
+  if not serverTask then return end
+
+  probeServerReadiness(function(state, detail)
+    if gen ~= serverGeneration then return end
+
+    if state == "ready" then
+      serverReady = true
+      serverStatusText = "就緒"
+      appendErrorLog("server: ready at " .. serverBaseURL()
+                     .. " model=" .. tostring(serverModelPath))
+      updateMenubar("🎤", "PTT Whisper v" .. VERSION .. " — Server 就緒")
+      return
+    end
+
+    if state == "loading" then
+      serverStatusText = "模型載入中…"
+    elseif state == "foreign" then
+      -- 我們啟動的行程活著，但 /health 回的不是就緒的 whisper-server 格式。
+      -- 啟動早期可能如此，因此繼續輪詢，但絕不標成 ready。
+      serverStatusText = "等待有效的 /health 回應…"
+      appendErrorLog("server: unexpected /health — " .. tostring(detail))
+    else
+      serverStatusText = "等待行程接受連線…"
+    end
+
+    if hs.timer.secondsSinceEpoch() >= deadline then
+      appendErrorLog(string.format(
+        "server: not ready within %ds (last state=%s), falling back to CLI",
+        SERVER_READY_TIMEOUT_SEC, state))
+      stopServer("啟動逾時（改用 CLI）")
+      hs.alert.show("⚠️ whisper-server 啟動逾時，改用 CLI 模式", 3)
+      return
+    end
+
+    hs.timer.doAfter(SERVER_POLL_INTERVAL_SEC, function()
+      pollUntilReady(gen, deadline)
+    end)
+  end)
+end
+
+startServer = function()
+  if not SERVER_MODE then return end
+  if serverTask then return end
+
+  local bin = findWhisperServerBin()
+  if not bin then
+    serverStatusText = "找不到 whisper-server"
+    appendErrorLog("server: whisper-server binary not found, using CLI")
+    return
+  end
+
+  local modelPath = resolveModelPath(nil)
+  if not modelPath then
+    serverStatusText = "找不到 model"
+    appendErrorLog("server: model not found, using CLI")
+    return
+  end
+
+  local gen = bumpGeneration()
+  serverStatusText = "檢查埠…"
+
+  -- 先確認 port 沒被占用。這是「占用偵測」，與「模型就緒偵測」是兩件事：
+  -- 佔著這個 port 的可能是別的 HTTP 服務，也可能是上次沒收乾淨的殘留行程。
+  -- 兩種情況我們都無從得知它載入的是哪個模型，貿然使用可能拿到錯的結果，
+  -- 因此一律不啟動、退回 CLI，由使用者決定要清掉它還是換 server_port。
+  probeEndpointOccupancy(function(occupied, detail)
+    if gen ~= serverGeneration then return end
+
+    if occupied then
+      serverStatusText = string.format("埠 %d 已被占用（改用 CLI）", SERVER_PORT)
+      appendErrorLog(string.format(
+        "server: port %d already occupied [%s], refusing to start; using CLI",
+        SERVER_PORT, tostring(detail)))
+      hs.alert.show(string.format(
+        "⚠️ 埠 %d 已被占用，改用 CLI 模式", SERVER_PORT), 3)
+      return
+    end
+
+    local args = {
+      "-m", modelPath,
+      "--host", SERVER_HOST,
+      "--port", tostring(SERVER_PORT),
+      "-t", tostring(WHISPER_THREADS > 0 and WHISPER_THREADS or detectPerfCores()),
+    }
+
+    -- VAD：同樣先確認這個 build 支援才帶上
+    if VAD_ENABLED ~= "false" then
+      local helpText = runCommandSync(bin, {"--help"}, {stderr = true}) or ""
+      if helpText:find("%-%-vad") then
+        local whisperDir = os.getenv("WHISPER_DIR")
+                           or (os.getenv("HOME") .. "/whisper.cpp")
+        local out = runCommandSync("/bin/ls", {whisperDir .. "/models"}) or ""
+        for line in out:gmatch("[^\n]+") do
+          if line:match("^ggml%-silero.*%.bin$") then
+            table.insert(args, "--vad")
+            table.insert(args, "--vad-model")
+            table.insert(args, whisperDir .. "/models/" .. line)
+            break
+          end
+        end
+      end
+    end
+
+    serverModelPath = modelPath
+    serverReady     = false
+    serverStatusText = "啟動中…"
+
+    local task
+    task = hs.task.new(bin, function(exitCode, _, stderr)
+      hs.timer.doAfter(0, function()
+        -- 舊 server 的 exit callback 絕不能改到新 server 的狀態
+        if gen ~= serverGeneration then return end
+        appendErrorLog("server: exited unexpectedly exit=" .. tostring(exitCode)
+                       .. " stderr=" .. (stderr or ""):sub(1, 200))
+        serverTask  = nil
+        serverReady = false
+        serverStatusText = "已結束（exit " .. tostring(exitCode) .. "）"
+        -- bump 讓同代的 poll loop 立刻停止
+        bumpGeneration()
+      end)
+    end, function(_, _, stderr)
+      if stderr and stderr ~= "" then
+        appendErrorLog("server stderr: " .. stderr:sub(1, 200))
+      end
+      return true
+    end, args)
+
+    serverTask = task
+
+    if task:start() then
+      appendErrorLog("server: starting " .. bin .. " model=" .. modelPath
+                     .. " gen=" .. gen)
+      pollUntilReady(gen, hs.timer.secondsSinceEpoch() + SERVER_READY_TIMEOUT_SEC)
+    else
+      if gen ~= serverGeneration then return end
+      serverTask = nil
+      serverStatusText = "啟動失敗"
+      appendErrorLog("server: failed to start, using CLI")
+    end
+  end)
+end
+
+--- [SV1] 讀 transcribe.sh 寫下的後端標記。
+--- server 模式會靜默退回 CLI，沒有這個顯示使用者無從得知它到底有沒有在用。
+--- 值可能是 server / cli / cache:server / cache:cli
+--- 快取命中會保留是哪個 backend 的 namespace，否則開了 server 卻一直命中
+--- 快取時，使用者看不出 server 到底有沒有在用。
+local function lastBackendLabel()
+  local f = io.open(PTT_DIR .. "/last_backend.txt", "r")
+  if not f then return "尚無記錄" end
+  local v = (f:read("*l") or ""):match("^%s*(.-)%s*$")
+  f:close()
+  local cached = v:match("^cache:(.+)$")
+  if cached then
+    return "📦 快取（" .. (cached == "server" and "server" or "CLI") .. " 產生）"
+  end
+  if v == "server" then return "⚡ server" end
+  if v == "cli" then return "📼 CLI" end
+  return "尚無記錄"
+end
+
+--- 重啟：等舊行程真正結束再啟動，而不是 sleep 固定秒數然後祈禱。
+local function restartServer()
+  local task = stopServer("重啟中…")
+  local gen = serverGeneration
+  waitForTaskExit(task, hs.timer.secondsSinceEpoch() + SERVER_STOP_TIMEOUT_SEC,
+    function(exited)
+      -- 等待期間若又有人 stop/start，這次重啟就作廢
+      if gen ~= serverGeneration then return end
+      if not exited then
+        appendErrorLog(string.format(
+          "server: previous process still running after %ds; starting anyway "
+          .. "(port bind may fail, will fall back to CLI)", SERVER_STOP_TIMEOUT_SEC))
+      end
+      startServer()
+    end)
+end
+
+PTTWhisper.startServer   = startServer
+PTTWhisper.stopServer    = stopServer
+PTTWhisper.restartServer = restartServer
+PTTWhisper.serverState   = function()
+  return {
+    generation = serverGeneration,
+    ready      = serverReady,
+    status     = serverStatusText,
+    model      = serverModelPath,
+    running    = serverTask ~= nil,
+  }
 end
 
 -- ── 統一失敗出口 ────────────────────────────────────────────
@@ -783,58 +1399,6 @@ end
 PTTWhisper.normalizeForMatch    = normalizeForMatch
 PTTWhisper.filterHallucinations = filterHallucinations
 
---- [F5][R8] 清理 whisper.cpp --stream 的輸出
-local function cleanStreamOutput(raw)
-  if not raw or raw == "" then return "" end
-  local cleaned = raw:gsub("\27%[[%d;]*[A-Za-z]", "")
-  cleaned = cleaned:gsub("\r", "\n")
-  cleaned = cleaned:gsub("%[%d+:%d+:%d+%.%d+%s*%-%->%s*%d+:%d+:%d+%.%d+%]", "")
-  cleaned = cleaned:gsub("%[BLANK_AUDIO%]", "")
-  cleaned = cleaned:gsub("%[[Ss]ilence%]", "")
-  cleaned = cleaned:gsub("%[[Mm]usic%]", "")
-
-  local lines = {}
-  for line in cleaned:gmatch("[^\n]+") do
-    local trimmed = line:match("^%s*(.-)%s*$")
-    if trimmed ~= "" then table.insert(lines, trimmed) end
-  end
-  if #lines == 0 then return "" end
-
-  local unique = {}
-  for _, line in ipairs(lines) do
-    if line ~= unique[#unique] then table.insert(unique, line) end
-  end
-  return table.concat(unique, " ")
-end
-
--- ── [P2] Streaming 累積器 ───────────────────────────────────
-local function resetStreamAccumulator()
-  streamChunks = {}
-  streamChunksSize = 0
-end
-
-local function appendStreamChunk(data)
-  if not data or data == "" then return true end
-  local dataLen = #data
-  if streamChunksSize + dataLen > STREAM_ACCUMULATOR_MAX_BYTES then
-    if streamChunksSize < STREAM_ACCUMULATOR_MAX_BYTES then
-      appendErrorLog(string.format(
-        "streaming: accumulator reached limit (%d bytes), discarding further output",
-        STREAM_ACCUMULATOR_MAX_BYTES))
-    end
-    return false
-  end
-  table.insert(streamChunks, data)
-  streamChunksSize = streamChunksSize + dataLen
-  return true
-end
-
-local function flushStreamAccumulator()
-  local result = table.concat(streamChunks)
-  resetStreamAccumulator()
-  return result
-end
-
 -- ── 傳統模式主流程 ──────────────────────────────────────────
 
 local function startRecording()
@@ -843,8 +1407,6 @@ local function startRecording()
       hs.alert.show("⚠️ 轉錄中，請稍候...", 1)
     elseif currentState == STATE.PASTING then
       hs.alert.show("⚠️ 貼上中，請稍候...", 1)
-    elseif currentState == STATE.STREAMING then
-      hs.alert.show("⚠️ 串流轉錄中...", 1)
     end
     return
   end
@@ -908,9 +1470,14 @@ local function stopRecordingAndTranscribe()
   local duration = recordStartAt
                    and (hs.timer.secondsSinceEpoch() - recordStartAt) or 0
   recordStartAt = nil
-  killTask(recordTask)
+  -- [B3] 留住參照，稍後要等這個行程真正結束才檢查錄音檔
+  local finishedRecordTask = recordTask
+  local killedAt = hs.timer.secondsSinceEpoch()
+  killTask(finishedRecordTask)
   recordTask = nil
   playSound(SOUND_REC_STOP)
+
+  appendErrorLog(string.format("recording: 按住 %.2fs", duration))
 
   if duration < MIN_RECORD_SEC then
     currentState = STATE.IDLE
@@ -922,16 +1489,23 @@ local function stopRecordingAndTranscribe()
   currentState = STATE.TRANSCRIBING
   updateMenubar("⏳", "PTT Whisper — Transcribing...")
   local savedClipboard = saveClipboard()
-  local langOverride, modelOverride, appName = getLangModelForCurrentApp()
+  local langOverride, modelOverride, appName, appPrompt = getLangModelForCurrentApp()
+  local promptText = buildPrompt(appPrompt)
 
-  hs.timer.doAfter(FFMPEG_FLUSH_SEC, function()
+  -- [B3] 等 ffmpeg 真正結束再檢查檔案，而不是固定延遲後就假設它寫完了。
+  -- 原本固定等 FFMPEG_FLUSH_SEC(0.3s) 就檢查，但 ffmpeg 需要 0.7~0.9 秒收尾，
+  -- 短錄音時檔案還是 0 bytes —— 真機三輪測試三次命中。
+  local function afterRecordingSettled()
     if sid ~= sessionCounter then return end
     if currentState ~= STATE.TRANSCRIBING then return end
 
     local valid, errMsg = isRecordFileValid()
     if not valid then
-      abortToIdle(errMsg, { log = "skipped: " .. errMsg,
-                            alert = "⚠️ " .. errMsg .. "，跳過轉錄" })
+      abortToIdle(errMsg, {
+        log = string.format("skipped: %s（按住 %.2fs）", errMsg, duration),
+        alert = "⚠️ 沒有錄到聲音，請按住久一點再說話",
+        alertDur = 2,
+      })
       return
     end
 
@@ -945,13 +1519,39 @@ local function stopRecordingAndTranscribe()
     end
 
     local env = {
-      PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+      -- [P3-1] 必須包含 /sbin：macOS 的 md5 在 /sbin/md5，
+      -- 少了它 transcribe.sh 算不出 AUDIO_HASH，cache_enabled 會靜默失效
+      PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
       HOME = os.getenv("HOME"),
     }
     if CACHE_ENABLED then env.WHISPER_CACHE = "true" end
     if FALLBACK_MODEL ~= "" then env.WHISPER_FALLBACK_MODEL = FALLBACK_MODEL end
+    -- [P3] 推理參數
+    if promptText ~= "" then env.WHISPER_PROMPT = promptText end
+    env.WHISPER_VAD = VAD_ENABLED
+    -- [B2] 只有明確設定 0~224 才帶；-1 表示交給 whisper 預設
+    if MAX_CONTEXT >= 0 then
+      env.WHISPER_MAX_CONTEXT = tostring(MAX_CONTEXT)
+    end
+    -- 0 = 不指定，交給 transcribe.sh 依 CPU 自動偵測
+    if WHISPER_THREADS > 0 then
+      env.WHISPER_THREADS = tostring(WHISPER_THREADS)
+    end
+    -- [SV1] 只在 server 真的就緒時才叫 transcribe.sh 走 server；
+    -- 沒就緒就完全不提，讓它照原本的 CLI 路徑跑
+    if SERVER_MODE and serverTask and serverReady then
+      env.WHISPER_SERVER = "true"
+      env.WHISPER_SERVER_URL = serverBaseURL()
+      if serverModelPath then
+        env.WHISPER_SERVER_MODEL = serverModelPath
+      end
+    end
+    -- [MC2] WHISPER_CACHE_MAX 也要轉發，否則這個旋鈕只在直接執行
+    -- transcribe.sh 時有效，從 Hammerspoon 走完全接不到（永遠是預設 50）
     for _, k in ipairs({"WHISPER_DIR", "WHISPER_MODEL", "WHISPER_LANG",
-                        "WHISPER_TIMEOUT", "WHISPER_AUTO_RESAMPLE"}) do
+                        "WHISPER_TIMEOUT", "WHISPER_AUTO_RESAMPLE",
+                        "WHISPER_CACHE_MAX", "WHISPER_VAD_MODEL",
+                        "WHISPER_PROMPT_MAX_BYTES"}) do
       local v = os.getenv(k)
       if v then env[k] = v end
     end
@@ -998,176 +1598,21 @@ local function stopRecordingAndTranscribe()
       transcribeTask = nil
       abortToIdle("Script Failed", { alert = "❌ transcribe.sh 啟動失敗" })
     end
-  end)
-end
-
--- ── [R6] Streaming 降級 ─────────────────────────────────────
-local function handleStreamingFailure(reason)
-  streamingFailCount = streamingFailCount + 1
-  appendErrorLog(string.format(
-    "streaming: %s (fail_count=%d/%d)",
-    reason, streamingFailCount, STREAMING_FALLBACK_THRESHOLD))
-
-  if streamingFailCount >= STREAMING_FALLBACK_THRESHOLD then
-    STREAMING_MODE = false
-    appendErrorLog("streaming: reached failure threshold, permanently switching to traditional mode")
-    hs.alert.show(string.format(
-      "⚠️ Streaming 連續失敗 %d 次，已切換傳統模式\nReload 可恢復",
-      streamingFailCount), 3)
-    return true
-  else
-    hs.alert.show(string.format(
-      "⚠️ Streaming 失敗（%d/%d），本次使用傳統模式",
-      streamingFailCount, STREAMING_FALLBACK_THRESHOLD), 2)
-    return false
-  end
-end
-
--- ── [F5] Streaming 模式主流程 ───────────────────────────────
-
-local function startStreaming()
-  if currentState ~= STATE.IDLE then
-    hs.alert.show("⚠️ 忙碌中，請稍候...", 1)
-    return
   end
 
-  local whisperBin = findWhisperBin()
-  if not whisperBin then
-    appendErrorLog("streaming: whisper.cpp not found, falling back")
-    startRecording()
-    return
-  end
-
-  local langOverride, modelOverride, appName = getLangModelForCurrentApp()
-  local modelPath = resolveModelPath(modelOverride)
-  if not modelPath then
-    appendErrorLog("streaming: model not found, falling back")
-    startRecording()
-    return
-  end
-
-  sessionCounter = sessionCounter + 1
-  local sid = sessionCounter
-  resetStreamAccumulator()
-
-  currentState  = STATE.STREAMING
-  recordStartAt = hs.timer.secondsSinceEpoch()
-  updateMenubar("🔴", "PTT Whisper — Streaming...")
-
-  local args = {
-    "--stream",
-    "-m", modelPath,
-    "-nt",
-    "--step", tostring(STREAMING_STEP_MS),
-    "--length", tostring(STREAMING_LENGTH_MS),
-    "-nc",
-  }
-  if langOverride and langOverride ~= "" then
-    table.insert(args, "-l")
-    table.insert(args, langOverride)
-  end
-
-  appendErrorLog(string.format(
-    "streaming: start app=%s lang=%s model=%s",
-    appName, langOverride or "(auto)", modelPath))
-
-  streamTask = hs.task.new(
-    whisperBin,
-    function(exitCode, stdout, stderr)
-      cancelKillFallbackTimer()
-      hs.timer.doAfter(0, function()
-        if not streamTask then return end
-        streamTask = nil
-        if currentState == STATE.STREAMING and sid == sessionCounter then
-          if streamChunksSize == 0 and exitCode ~= 0 and exitCode ~= 255 then
-            currentState = STATE.IDLE
-            handleStreamingFailure("unexpected exit=" .. tostring(exitCode))
-          end
-        end
-      end)
-    end,
-    function(task, stdout, stderr)
-      if stdout and stdout ~= "" then appendStreamChunk(stdout) end
-      if stderr and stderr ~= "" then
-        appendErrorLog("streaming stderr: " .. stderr:sub(1, 200))
-      end
-      return true
-    end,
-    args
-  )
-
-  if streamTask:start() then
-    playSound(SOUND_REC_START)
-    -- [CR9] streamingFailCount 不在此處重置——
-    -- [CR13] 成功時改為漸進式衰減（見 stopStreaming），避免歸零繞過降級保護
-  else
-    streamTask = nil; recordStartAt = nil
-    currentState = STATE.IDLE
-    local switched = handleStreamingFailure("whisper.cpp --stream failed to start")
-    if not switched then startRecording() end
-  end
-end
-
-local function stopStreaming()
-  if currentState ~= STATE.STREAMING then return end
-  local sid = sessionCounter
-
-  local duration = recordStartAt
-                   and (hs.timer.secondsSinceEpoch() - recordStartAt) or 0
-  recordStartAt = nil
-
-  if streamTask then killTask(streamTask); streamTask = nil end
-  playSound(SOUND_REC_STOP)
-
-  if duration < MIN_RECORD_SEC then
-    currentState = STATE.IDLE
-    resetStreamAccumulator()
-    updateMenubar("🎤", string.format(
-      "PTT Whisper v%s — 誤觸忽略（%.2fs）", VERSION, duration))
-    return
-  end
-
-  hs.timer.doAfter(0.15, function()
-    if sid ~= sessionCounter then resetStreamAccumulator(); return end
-
-    local rawOutput = flushStreamAccumulator()
-    local text = cleanStreamOutput(rawOutput)
-    text = filterHallucinations(text)
-
-    appendErrorLog(string.format(
-      "streaming: duration=%.1fs raw_len=%d result_len=%d",
-      duration, #rawOutput, #text))
-
-    if text == "" then
-      abortToIdle("Ready", { alert = "🤔 未偵測到語音", icon = "🎤" })
-      return
-    end
-
-    -- [CR13] Streaming 成功產出文字 → failCount 遞減 1（floor 0）
-    -- 漸進式衰減：不會被單次成功歸零繞過降級保護，
-    -- 但也不會讓偶發性的歷史失敗永久累積
-    -- 範例：fail 2 → success 1 → fail 1 → count=2（不觸發降級）
-    --       fail 2 → success 0 → fail 1 → count=3（觸發降級）
-    if streamingFailCount > 0 then
-      streamingFailCount = streamingFailCount - 1
+  waitForTaskExit(finishedRecordTask,
+    hs.timer.secondsSinceEpoch() + RECORD_EXIT_TIMEOUT_SEC,
+    function(exited)
       appendErrorLog(string.format(
-        "streaming: success, failCount decayed to %d/%d",
-        streamingFailCount, STREAMING_FALLBACK_THRESHOLD))
-    end
-
-    currentState = STATE.PASTING
-    updateMenubar("📋", "PTT Whisper — Pasting...")
-    local savedClipboard = saveClipboard()
-    local previewTooltip = nil
-    if SHOW_PREVIEW_ALERT then
-      local preview, truncated = utf8Sub(text, 20)
-      hs.alert.show("✅ " .. preview .. (truncated and "…" or ""), 2)
-    else
-      local preview, truncated = utf8Sub(text, 30)
-      previewTooltip = "✅ " .. preview .. (truncated and "…" or "")
-    end
-    pasteText(text, savedClipboard, sid, previewTooltip)
-  end)
+        "recording: ffmpeg %s（SIGINT 後 %.2fs）",
+        exited and "已結束" or "未結束", hs.timer.secondsSinceEpoch() - killedAt))
+      if not exited then
+        appendErrorLog(string.format(
+          "ffmpeg 未在 %.1fs 內結束，仍嘗試讀取錄音檔", RECORD_EXIT_TIMEOUT_SEC))
+      end
+      -- 行程已結束，再留一點時間給檔案系統把資料落地
+      hs.timer.doAfter(FFMPEG_FLUSH_SEC, afterRecordingSettled)
+    end)
 end
 
 -- ── [F7][CR1] 健康檢查 / 自我診斷 ──────────────────────────
@@ -1224,36 +1669,21 @@ local function runDiagnostics()
     return path .. " — " .. firstLine:gsub("%s+$", "")
   end)
 
-  -- 4. --stream 支援
-  check("--stream 支援", function()
-    local path = findWhisperBin()
-    if not path then return "!whisper.cpp 未安裝" end
-    local helpText = runCommandSync(path, {"--help"}, {stderr = true})
-    if helpText and helpText:find("%-%-stream") then return "支援" end
-    return "!此 build 不支援 --stream"
-  end)
-
-  -- 5. [CR14] Model 檔案（含 Q5_0/FP16 標籤）
+  -- 4. [CR14] Model 檔案（含 Q5_0/FP16 標籤）
   check("Model 檔案", function()
     local modelPath = resolveModelPath(nil)
     if not modelPath then return "!預設 model 不存在" end
     local attr = hs.fs.attributes(modelPath)
     local sizeMB = attr and math.floor((attr.size or 0) / 1024 / 1024) or 0
-    -- [CR14] 標記模型類型，讓使用者一眼可辨是否正在使用量化版本
-    local tag
-    if modelPath:find("q5_0") then
-      tag = "Q5_0"
-    elseif modelPath:find("q5_1") then
-      tag = "Q5_1"
-    elseif modelPath:find("q8_0") then
-      tag = "Q8_0"
-    else
-      tag = "FP16"
-    end
+    -- [CR14][MC1] 標記模型類型，讓使用者一眼可辨是否正在使用量化版本
+    -- 通用比對檔名尾端的量化後綴（q5_1 / q5_0 / q8_0 / q4_k_m ...），
+    -- 比對不到就是未量化的 FP16
+    local suffix = modelPath:match("%-(q[%w_]+)%.bin$")
+    local tag = suffix and suffix:upper() or "FP16"
     return string.format("%s (%dMB) [%s]", modelPath, sizeMB, tag)
   end)
 
-  -- 6. Fallback model
+  -- 5. Fallback model
   if FALLBACK_MODEL ~= "" then
     check("Fallback Model", function()
       local path = resolveModelPath(FALLBACK_MODEL)
@@ -1262,7 +1692,7 @@ local function runDiagnostics()
     end)
   end
 
-  -- 7. transcribe.sh
+  -- 6. transcribe.sh
   check("transcribe.sh", function()
     local ok, err = isTranscribeScriptReady()
     if not ok then return "!" .. err end
@@ -1278,7 +1708,7 @@ local function runDiagnostics()
     return TRANSCRIBE_SH
   end)
 
-  -- 8. 麥克風權限
+  -- 7. 麥克風權限
   check("麥克風權限", function()
     local ffmpeg = findFFmpeg()
     if not ffmpeg then return "!無法測試（ffmpeg 不存在）" end
@@ -1296,7 +1726,7 @@ local function runDiagnostics()
     return "!測試失敗 — " .. (output or ""):sub(1, 80)
   end)
 
-  -- 9. 磁碟空間
+  -- 8. 磁碟空間
   check("磁碟空間", function()
     local output = runCommandSync("/bin/df", {"-h", os.getenv("HOME")})
     local lastLine = ""
@@ -1306,14 +1736,14 @@ local function runDiagnostics()
     return avail .. " 可用"
   end)
 
-  -- 10. PTT_DIR 權限
+  -- 9. PTT_DIR 權限
   check("PTT_DIR 權限", function()
     local attr = hs.fs.attributes(PTT_DIR)
     if not attr then return "!" .. PTT_DIR .. " 不存在" end
     return PTT_DIR .. " — " .. (attr.permissions or "unknown")
   end)
 
-  -- 11. timeout 指令
+  -- 10. timeout 指令
   check("timeout 指令", function()
     local gt = runCommandSync("/usr/bin/which", {"gtimeout"}, {stderr = true})
     gt = (gt or ""):gsub("%s+$", "")
@@ -1324,7 +1754,7 @@ local function runDiagnostics()
     return "!找不到 — brew install coreutils"
   end)
 
-  -- 12. 共用幻覺列表
+  -- 11. 共用幻覺列表
   check("hallucinations_builtin.txt", function()
     local attr = hs.fs.attributes(BUILTIN_HALLUCINATION_FILE)
     if not attr then return "!不存在（使用硬編碼 fallback）" end
@@ -1340,7 +1770,7 @@ local function runDiagnostics()
     return string.format("%d 條規則（+ normalized 兩層比對）", count)
   end)
 
-  -- 13. [CR10] Config 驗證結果
+  -- 12. [CR10] Config 驗證結果
   -- [CR12] 現在能區分「無設定檔」vs「空檔」vs「JSON 壞掉」vs「正常+警告」
   check("config.json 驗證", function()
     if not lastConfigValidation then return "無設定檔（正常，使用預設值）" end
@@ -1349,7 +1779,7 @@ local function runDiagnostics()
     return "!" .. #w .. " 項警告：" .. table.concat(w, "; ")
   end)
 
-  -- 14. [CR15] 濾波器鏈 dry-run 驗證
+  -- 13. [CR15] 濾波器鏈 dry-run 驗證
   -- 使用 FFmpeg 的 lavfi 虛擬音源做一次快速 dry-run，
   -- 驗證 -af 參數語法是否合法，避免實際錄音時才發現錯誤
   check("濾波器鏈", function()
@@ -1369,11 +1799,102 @@ local function runDiagnostics()
     return "!" .. errLine
   end)
 
+  -- 14. [P3] whisper.cpp 旗標支援度
+  check("whisper.cpp 旗標", function()
+    local path = findWhisperBin()
+    if not path then return "!whisper.cpp 未安裝" end
+    local helpText = runCommandSync(path, {"--help"}, {stderr = true}) or ""
+    local supported, missing = {}, {}
+    for _, flag in ipairs({"--threads", "--max-context", "--prompt", "--vad"}) do
+      -- Lua pattern 需跳脫 "-"
+      if helpText:find(flag:gsub("%-", "%%-")) then
+        table.insert(supported, flag)
+      else
+        table.insert(missing, flag)
+      end
+    end
+    if #missing == 0 then
+      return "全部支援（" .. table.concat(supported, " ") .. "）"
+    end
+    -- 缺旗標不是錯誤：transcribe.sh 會自動略過不支援的項目
+    return string.format("支援 %s ／ 此 build 無 %s（會自動略過）",
+      table.concat(supported, " "), table.concat(missing, " "))
+  end)
+
+  -- 15. [P3] VAD
+  check("VAD", function()
+    if VAD_ENABLED == "false" then return "已停用（vad_enabled: false）" end
+    local whisperDir = os.getenv("WHISPER_DIR")
+                       or (os.getenv("HOME") .. "/whisper.cpp")
+    -- 與 transcribe.sh 一致：用 glob 掃描，不寫死 silero 版本號
+    local out = runCommandSync("/bin/ls", {whisperDir .. "/models"}) or ""
+    local vadModel = nil
+    for line in out:gmatch("[^\n]+") do
+      if line:match("^ggml%-silero.*%.bin$") then vadModel = line; break end
+    end
+    if not vadModel then
+      local hint = "!找不到 VAD model — cd " .. whisperDir
+                   .. " && bash ./models/download-vad-model.sh silero-v5.1.2"
+      -- auto 模式下沒有 model 只是「不啟用」，不算故障
+      if VAD_ENABLED == "auto" then
+        return "未啟用（無 VAD model）— 下載後 auto 模式會自動啟用"
+      end
+      return hint
+    end
+    local path = findWhisperBin()
+    if path then
+      local helpText = runCommandSync(path, {"--help"}, {stderr = true}) or ""
+      if not helpText:find("%-%-vad") then
+        return "!此 whisper.cpp build 不支援 --vad（請更新 whisper.cpp）"
+      end
+    end
+    return "啟用 — " .. vadModel
+  end)
+
+  -- 16. [P3] Initial prompt
+  check("Initial prompt", function()
+    local _, _, appName, appPrompt = getLangModelForCurrentApp()
+    local combined = buildPrompt(appPrompt)
+    if combined == "" then return "未設定" end
+    local preview, truncated = utf8Sub(combined, 40)
+    return string.format("%s%s（%d bytes，前景 App：%s）",
+      preview, truncated and "…" or "", #combined, appName)
+  end)
+
+  -- 17. [SV1] whisper-server
+  check("whisper-server", function()
+    if not SERVER_MODE then return "已停用（server_mode: false）" end
+    local bin = findWhisperServerBin()
+    if not bin then
+      return "!找不到 whisper-server — 需要 cmake --build 產出 build/bin/whisper-server"
+    end
+    if not serverTask then
+      return "!未執行 — " .. serverStatusText
+    end
+    if not serverReady then
+      return "!未就緒 — " .. serverStatusText
+    end
+    return string.format("%s — %s（model: %s）",
+      serverStatusText, serverBaseURL(), serverModelPath or "?")
+  end)
+
+  -- 18. [SV1] 上次實際使用的後端
+  check("上次轉錄後端", function()
+    local label = lastBackendLabel()
+    if label == "尚無記錄" then return "尚無記錄（還沒轉錄過）" end
+    -- 開了 server 卻實際走 CLI，代表有東西不對，值得提醒。
+    -- 快取命中不算——那不是降級。
+    if SERVER_MODE and label == "📼 CLI" then
+      return "!" .. label .. " — server_mode 已開啟但上次走的是 CLI，見 Error Log"
+    end
+    return label
+  end)
+
   -- 組裝報告
   local header = string.format(
-    "=== PTT Whisper v%s Diagnostics ===\n%s\nMode: %s",
+    "=== PTT Whisper v%s Diagnostics ===\n%s\nBackend: %s",
     VERSION, os.date("%Y-%m-%d %H:%M:%S"),
-    STREAMING_MODE and "Streaming" or "Traditional")
+    (SERVER_MODE and serverReady) and "server" or "CLI")
 
   local report = header .. "\n\n" .. table.concat(results, "\n")
   local status = allOk and "\n\n🎉 所有檢查通過！" or "\n\n⚠️ 部分項目需要處理"
@@ -1401,20 +1922,28 @@ end
 
 PTTWhisper.runDiagnostics = runDiagnostics
 
+-- ── [HK1] 熱鍵狀態（必須宣告在 cleanup 之前）──────────────
+local modifierTap      = nil
+local hotkeyObj        = nil
+local modifierIsHeld   = false
+local HOTKEY_MECHANISM = "(未綁定)"
+
 -- ── Cleanup ─────────────────────────────────────────────────
 local function cleanup()
   if recordTask then pcall(function() recordTask:terminate() end) end
   if transcribeTask then pcall(function() transcribeTask:terminate() end) end
-  if streamTask then pcall(function() streamTask:terminate() end) end
   cancelKillFallbackTimer()
   recordTask     = nil
   transcribeTask = nil
-  streamTask     = nil
   currentState   = STATE.IDLE
   recordStartAt  = nil
-  resetStreamAccumulator()
-  streamingFailCount = 0
   os.remove(RECORD_FILE)
+  -- [HK1] 收掉修飾鍵 eventtap，否則 reload 會累積多個 tap
+  if modifierTap then pcall(function() modifierTap:stop() end); modifierTap = nil end
+  if hotkeyObj then pcall(function() hotkeyObj:delete() end); hotkeyObj = nil end
+  modifierIsHeld = false
+  -- [SV1] 一定要收掉常駐 server，否則 reload 後埠會被殘留行程占住
+  stopServer()
   if menubarItem then menubarItem:delete(); menubarItem = nil end
 end
 
@@ -1428,13 +1957,11 @@ end
 
 -- ── 主入口 ──────────────────────────────────────────────────
 local function onKeyDown()
-  if STREAMING_MODE then startStreaming() else startRecording() end
+  startRecording()
 end
 
 local function onKeyUp()
-  if currentState == STATE.STREAMING then
-    stopStreaming()
-  elseif currentState == STATE.RECORDING then
+  if currentState == STATE.RECORDING then
     stopRecordingAndTranscribe()
   end
 end
@@ -1466,8 +1993,6 @@ if menubarItem then
       { title = "PTT Whisper v" .. VERSION, disabled = true },
       { title = "-" },
       { title = "狀態：" .. currentState, disabled = true },
-      { title = "模式：" .. (STREAMING_MODE and "⚡ Streaming" or "📼 Traditional"),
-        disabled = true },
       { title = "Session：#" .. sessionCounter, disabled = true },
       { title = "裝置：" .. AUDIO_DEVICE, disabled = true },
       { title = "熱鍵：" .. hotkeyLabel, disabled = true },
@@ -1476,9 +2001,18 @@ if menubarItem then
         disabled = true },
       { title = "濾波器：" .. (AUDIO_FILTER_CHAIN ~= "" and "ON" or "OFF"),
         disabled = true },
+      { title = "Server：" .. (SERVER_MODE and serverStatusText or "OFF"),
+        disabled = true },
+      { title = "上次後端：" .. lastBackendLabel(), disabled = true },
       { title = langModelMenuLabel(), disabled = true },
       { title = "-" },
       { title = "🔍 Run Diagnostics", fn = function() runDiagnostics() end },
+      { title = "🔄 重啟 whisper-server",
+        disabled = not SERVER_MODE,
+        fn = function()
+          hs.alert.show("重啟 whisper-server…", 2)
+          restartServer()
+        end },
       { title = "-" },
       { title = "列出音訊裝置（Console）", fn = function()
           listAudioDevices()
@@ -1493,10 +2027,12 @@ if menubarItem then
               f:write('{\n')
               f:write('  "slow_paste_apps": {},\n')
               f:write('  "show_preview_alert": true,\n')
-              f:write('  "streaming_mode": false,\n')
               f:write('  "cache_enabled": false,\n')
               f:write('  "fallback_model": "",\n')
               f:write('  "audio_filter_chain": "highpass=f=200,lowpass=f=5000,loudnorm=I=-16:TP=-1.5",\n')
+              f:write('  "initial_prompt": "",\n')
+              f:write('  "vad_enabled": "auto",\n')
+              f:write('  "server_mode": false,\n')
               f:write('  "lang_models": {\n')
               f:write('    "_default": { "lang": "auto" }\n')
               f:write('  }\n')
@@ -1526,13 +2062,56 @@ if menubarItem then
 end
 
 -- ── 熱鍵綁定 ────────────────────────────────────────────────
-hs.hotkey.bind(HOTKEY_MODS, HOTKEY_KEY, onKeyDown, onKeyUp)
+--- 判斷這個 flagsChanged 事件代表目標修飾鍵「按下」還是「放開」
+local function modifierIsDown(e, spec)
+  local ok, raw = pcall(function() return e:getRawEventData() end)
+  local flags = ok and raw and raw.CGEventData and raw.CGEventData.flags or nil
+  if type(flags) == "number" then
+    return maskIsSet(flags, spec.mask)
+  end
+  -- fallback：只看粗粒度 flag。左右同型修飾鍵同時按住時會失準，
+  -- 但不會造成誤觸發，只會延後放開的判定。
+  local f = e:getFlags() or {}
+  return f[spec.flag] == true
+end
+
+local spec = MODIFIER_KEYCODES[HOTKEY_KEY]
+if spec and #HOTKEY_MODS == 0 then
+  modifierTap = hs.eventtap.new({ hs.eventtap.event.types.flagsChanged }, function(e)
+    if e:getKeyCode() ~= spec.code then return false end
+    local down = modifierIsDown(e, spec)
+    if down and not modifierIsHeld then
+      modifierIsHeld = true
+      onKeyDown()
+    elseif (not down) and modifierIsHeld then
+      modifierIsHeld = false
+      onKeyUp()
+    end
+    return false  -- 不吞掉事件，其他 App 照常收到這個修飾鍵
+  end)
+  modifierTap:start()
+  HOTKEY_MECHANISM = "eventtap(flagsChanged)"
+else
+  -- 非修飾鍵仍走 hs.hotkey（它對一般按鍵是正確且更省資源的做法）
+  hotkeyObj = hs.hotkey.bind(HOTKEY_MODS, HOTKEY_KEY, onKeyDown, onKeyUp)
+  HOTKEY_MECHANISM = "hs.hotkey"
+end
+
+PTTWhisper.hotkeyMechanism = function()
+  return HOTKEY_MECHANISM,
+         (modifierTap ~= nil) and modifierTap:isEnabled() or (hotkeyObj ~= nil)
+end
+
+-- ── [SV1] 啟動常駐 server（server_mode = false 時直接 return）──
+-- 非同步：模型載入期間不阻塞 Hammerspoon 載入，
+-- 尚未就緒前的錄音會自動走 CLI 路徑
+startServer()
 
 -- ── 啟動提示 ────────────────────────────────────────────────
-local modeLabel = STREAMING_MODE and "⚡Streaming" or "📼Traditional"
+local backendLabel = SERVER_MODE and "⚡Server" or "📼CLI"
 hs.alert.show(string.format(
   "🎤 PTT Whisper v%s 已載入\n%s — 按住 %s 開始錄音",
-  VERSION, modeLabel, hotkeyLabel), 2)
+  VERSION, backendLabel, hotkeyLabel), 2)
 print(string.format(
   "PTT Whisper v%s loaded [%s] — run PTTWhisper.runDiagnostics() for health check",
-  VERSION, modeLabel))
+  VERSION, backendLabel))
