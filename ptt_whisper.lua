@@ -1,13 +1,18 @@
 -- ============================================================
 -- Push-to-Talk Whisper Dictation for Hammerspoon
--- v3.6.4
+-- v3.8.0
 --
--- v3.6.4 修正（第四輪 Code Review）：
---   CR12.[Fix]  loadExternalConfig 結構化回傳（區分無檔/空檔/解析失敗）
---   CR13.[Fix]  streamingFailCount 改為漸進式衰減（成功 -1，非歸零）
---   CR14.[Feat] Diagnostics 區分 Q5_0 / FP16 模型標籤
---   CR15.[Feat] Diagnostics 新增濾波器鏈 dry-run 驗證
+-- v3.8.0 新增（常駐 server）：
+--   SV1.[Feat] whisper-server 常駐模式，省掉每次錄音的模型載入成本
+--              預設關閉；任何失敗都自動退回 CLI 路徑
 --
+-- v3.7.0：P3（initial prompt、VAD、threads、max-context）、
+--         P3-1（PATH 補 /sbin，修好從未生效的快取）
+-- v3.6.5：MC1~MC2（模型候選掃描、WHISPER_CACHE_MAX 轉發）
+--
+-- 完整版本歷史見 CHANGELOG.md
+--
+-- v3.6.4：CR12~CR15（第四輪 Code Review）
 -- v3.6.3：CR7~CR11（第三輪 Code Review）
 -- v3.6.2：OPT1~OPT2（錄音品質 + 推理效能優化）
 -- v3.6.1：CR1~CR6（第二輪 Code Review）
@@ -19,11 +24,11 @@
 -- v3.0：E~K  v2.1：A~D
 --
 -- 使用方式：按住 Right Option 錄音，放開後自動轉錄並貼上
--- 依賴：ffmpeg、whisper.cpp 已編譯、~/ptt-whisper/transcribe.sh v2.8.4+
+-- 依賴：ffmpeg、whisper.cpp 已編譯、~/ptt-whisper/transcribe.sh v2.10.0+
 -- ============================================================
 
 -- ── 版本常數 ────────────────────────────────────────────────
-local VERSION = "3.6.4"
+local VERSION = "3.8.0"
 
 -- ── 設定區（Config）──────────────────────────────────────────
 
@@ -93,6 +98,39 @@ local CACHE_ENABLED = false
 -- ── [F6] Fallback Model ─────────────────────────────────────
 local FALLBACK_MODEL = ""
 
+-- ── [P3] 推理參數 ───────────────────────────────────────────
+-- initial prompt：注入術語 / 人名 / 中英混用詞，提升專有名詞辨識率。
+-- 全域 prompt 之後會再串接 lang_models[bid].prompt（見 getPromptForApp）。
+local INITIAL_PROMPT = ""
+
+-- VAD：砍掉靜音段，短錄音提速明顯，也能從源頭減少靜音幻覺。
+-- "auto" = whisper.cpp 支援且找得到 VAD model 才啟用
+local VAD_ENABLED = "auto"
+
+-- max-context：PTT 是獨立短句，不需跨段上下文；0 可減少重複／拖尾幻覺
+local MAX_CONTEXT = 0
+
+-- 執行緒數：0 = 交給 transcribe.sh 自動偵測（Apple Silicon 取效能核心數）
+local WHISPER_THREADS = 0
+
+-- ── [SV1] 常駐 whisper-server ───────────────────────────────
+-- CLI 模式每次錄音都要重新載入模型（small 約 0.3~0.5s）。常駐 server 把模型
+-- 留在記憶體，省掉這段固定成本。預設關閉：這會多一個長駐行程（約佔用一份
+-- 模型大小的 RAM），是否值得應該由使用者自己決定，不該升級後自動出現。
+local SERVER_MODE = false
+local SERVER_PORT = 8178
+local SERVER_HOST = "127.0.0.1"
+-- 模型載入可能要好幾秒，啟動後輪詢到就緒為止
+local SERVER_READY_TIMEOUT_SEC = 20
+local SERVER_POLL_INTERVAL_SEC = 0.4
+
+local WHISPER_SERVER_BIN_CANDIDATES = {
+  "/build/bin/whisper-server",
+  "/whisper-server",
+  "/build/bin/server",
+  "/server",
+}
+
 -- ── [R6] Streaming fallback 漸進式降級 ──────────────────────
 local STREAMING_FALLBACK_THRESHOLD = 3
 
@@ -107,6 +145,17 @@ local WHISPER_BIN_CANDIDATES = {
   "/build/bin/main",
 }
 
+-- ── [MC1] 預設模型候選清單（與 transcribe.sh 保持一致）──────
+-- 量化版優先：速度 2~3x、RAM 減半、準確率幾乎無損（<0.5% WER 差異）。
+-- q5_1 排在 q5_0 之前：whisper.cpp 的 download-ggml-model.sh 對 small
+-- 只提供 q5_1（q5_0 僅 medium/large 有），q5_0 需自行 quantize。
+local DEFAULT_MODEL_CANDIDATES = {
+  "ggml-small-q5_1.bin",
+  "ggml-small-q5_0.bin",
+  "ggml-small-q8_0.bin",
+  "ggml-small.bin",
+}
+
 -- ── [CR3] Config 已知欄位白名單 ─────────────────────────────
 local CONFIG_KNOWN_KEYS = {
   slow_paste_apps = true,
@@ -118,6 +167,12 @@ local CONFIG_KNOWN_KEYS = {
   fallback_model = true,
   lang_models = true,
   audio_filter_chain = true,
+  initial_prompt = true,
+  vad_enabled = true,
+  max_context = true,
+  whisper_threads = true,
+  server_mode = true,
+  server_port = true,
 }
 
 -- ── [CR3] Config 驗證：集中處理型別、範圍、預設值 ────────────
@@ -179,7 +234,11 @@ local function validateConfig(config)
           if type(entry.model) == "string" and entry.model ~= "" then
             parsed.model = entry.model
           end
-          if parsed.lang or parsed.model then
+          -- [P3] per-app prompt：會接在全域 initial_prompt 之後
+          if type(entry.prompt) == "string" and entry.prompt ~= "" then
+            parsed.prompt = entry.prompt
+          end
+          if parsed.lang or parsed.model or parsed.prompt then
             LANG_MODELS[bid] = parsed
           end
         end
@@ -245,6 +304,68 @@ local function validateConfig(config)
       end
     else
       warn("audio_filter_chain: expected string")
+    end
+  end
+
+  -- [P3] initial_prompt: string
+  if config.initial_prompt ~= nil then
+    if type(config.initial_prompt) == "string" then
+      INITIAL_PROMPT = config.initial_prompt
+    else
+      warn("initial_prompt: expected string")
+    end
+  end
+
+  -- [P3] vad_enabled: boolean 或 "auto"
+  if config.vad_enabled ~= nil then
+    if type(config.vad_enabled) == "boolean" then
+      VAD_ENABLED = config.vad_enabled and "true" or "false"
+    elseif config.vad_enabled == "auto" then
+      VAD_ENABLED = "auto"
+    else
+      warn("vad_enabled: expected boolean or \"auto\"")
+    end
+  end
+
+  -- [P3] max_context: number, 0~224（whisper 的 n_text_ctx/2）
+  if config.max_context ~= nil then
+    if type(config.max_context) == "number"
+       and config.max_context >= 0
+       and config.max_context <= 224 then
+      MAX_CONTEXT = math.floor(config.max_context)
+    else
+      warn("max_context: expected number in 0~224")
+    end
+  end
+
+  -- [P3] whisper_threads: number, 0~16（0 = 自動偵測）
+  if config.whisper_threads ~= nil then
+    if type(config.whisper_threads) == "number"
+       and config.whisper_threads >= 0
+       and config.whisper_threads <= 16 then
+      WHISPER_THREADS = math.floor(config.whisper_threads)
+    else
+      warn("whisper_threads: expected number in 0~16 (0 = auto)")
+    end
+  end
+
+  -- [SV1] server_mode: boolean
+  if config.server_mode ~= nil then
+    if type(config.server_mode) == "boolean" then
+      SERVER_MODE = config.server_mode
+    else
+      warn("server_mode: expected boolean")
+    end
+  end
+
+  -- [SV1] server_port: number, 1024~65535
+  if config.server_port ~= nil then
+    if type(config.server_port) == "number"
+       and config.server_port >= 1024
+       and config.server_port <= 65535 then
+      SERVER_PORT = math.floor(config.server_port)
+    else
+      warn("server_port: expected number in 1024~65535")
     end
   end
 
@@ -465,8 +586,8 @@ local function findWhisperBin()
 end
 
 --- 解析 model 路徑
---- [OPT2] 預設優先使用 Q5_0 量化版（速度 2~3x, RAM -50%, 準確率幾乎無損）
----        若 Q5_0 不存在則自動 fallback 到原始 FP16 版本
+--- [MC1] 未指定 model 時，依 DEFAULT_MODEL_CANDIDATES 順序掃描：
+---        量化版（q5_1 → q5_0 → q8_0）優先，全都沒有才用 FP16
 local function resolveModelPath(modelName)
   local whisperDir = os.getenv("WHISPER_DIR")
                      or (os.getenv("HOME") .. "/whisper.cpp")
@@ -477,14 +598,17 @@ local function resolveModelPath(modelName)
     if envModel then
       path = envModel
     else
-      -- [OPT2] 優先 Q5_0，fallback 到 FP16
-      local q5Path = whisperDir .. "/models/ggml-small-q5_0.bin"
-      local fpPath = whisperDir .. "/models/ggml-small.bin"
-      if hs.fs.attributes(q5Path) then
-        path = q5Path
-      else
-        path = fpPath
+      -- [MC1] 依偏好順序掃描候選模型，量化版優先
+      for _, name in ipairs(DEFAULT_MODEL_CANDIDATES) do
+        local candidate = whisperDir .. "/models/" .. name
+        if hs.fs.attributes(candidate) then
+          path = candidate
+          break
+        end
       end
+      -- 全部候選皆不存在時仍指向 FP16 路徑，
+      -- 讓下方的存在性檢查回傳 nil、由呼叫端輸出明確錯誤
+      path = path or (whisperDir .. "/models/ggml-small.bin")
     end
   elseif modelName:sub(1, 1) == "/" then
     path = modelName
@@ -558,17 +682,31 @@ local function getPasteDelay()
   return PASTE_RESTORE_SEC
 end
 
---- 根據前景 app 取得語言/模型
+--- 根據前景 app 取得語言/模型/prompt
+--- @return string|nil lang, string|nil model, string appName, string|nil prompt
 local function getLangModelForCurrentApp()
   local ok, app = pcall(hs.application.frontmostApplication)
-  if not ok or not app then return nil, nil, "(unknown)" end
+  if not ok or not app then return nil, nil, "(unknown)", nil end
   local bid = app:bundleID() or ""
   local appName = app:name() or bid
   local entry = LANG_MODELS[bid] or LANG_MODELS["_default"]
-  if not entry then return nil, nil, appName end
+  if not entry then return nil, nil, appName, nil end
   local lang = entry.lang
   if lang == "auto" then lang = nil end
-  return lang, entry.model, appName
+  return lang, entry.model, appName, entry.prompt
+end
+
+--- [P3] 組出這次要用的 initial prompt
+--- 全域 initial_prompt 是通用術語表（你的名字、公司、常用中英混用詞），
+--- per-app prompt 是該 App 的領域術語 —— 兩者「串接」而非互相覆蓋，
+--- 這樣全域術語表在每個 App 都有效，不必逐個 App 重複貼一遍。
+--- @param appPrompt string|nil
+--- @return string  空字串 = 不帶 --prompt
+local function buildPrompt(appPrompt)
+  local parts = {}
+  if INITIAL_PROMPT ~= "" then table.insert(parts, INITIAL_PROMPT) end
+  if appPrompt and appPrompt ~= "" then table.insert(parts, appPrompt) end
+  return table.concat(parts, " ")
 end
 
 PTTWhisper.getLangModelForCurrentApp = getLangModelForCurrentApp
@@ -601,6 +739,203 @@ local function restoreClipboard(saved)
     pcall(hs.pasteboard.writeDataForUTI, nil, entry.uti, entry.data)
   end
 end
+
+-- ── [SV1] whisper-server 生命週期 ───────────────────────────
+-- 狀態：serverTask 存在 = 我們啟動的行程還活著；
+--       serverReady = HTTP 已經回應過（模型載入完成）；
+--       serverModelPath = server 載入的模型，用來判斷請求能否走 server。
+local serverTask       = nil
+local serverReady      = false
+local serverModelPath  = nil
+local serverStatusText = "未啟用"
+
+local function serverBaseURL()
+  return string.format("http://%s:%d", SERVER_HOST, SERVER_PORT)
+end
+
+--- 找 whisper-server 執行檔（與 findWhisperBin 同樣的搜尋策略）
+local function findWhisperServerBin()
+  local whisperDir = os.getenv("WHISPER_DIR")
+                     or (os.getenv("HOME") .. "/whisper.cpp")
+  for _, suffix in ipairs(WHISPER_SERVER_BIN_CANDIDATES) do
+    local path = whisperDir .. suffix
+    local attr = hs.fs.attributes(path)
+    if attr and attr.mode == "file" then return path end
+  end
+  return nil
+end
+
+--- 非同步健康檢查：任何 HTTP 回應都算「有人在聽」（404 也算）
+--- @param callback function(alive: boolean)
+local function checkServerHealth(callback)
+  hs.http.asyncGet(serverBaseURL() .. "/", nil, function(status)
+    -- status < 0 = 連線失敗；>= 100 = 有 HTTP 回應
+    callback(status ~= nil and status >= 100)
+  end)
+end
+
+local function stopServer()
+  if serverTask then
+    pcall(function()
+      if serverTask:isRunning() then serverTask:terminate() end
+    end)
+    serverTask = nil
+  end
+  serverReady = false
+  serverModelPath = nil
+  serverStatusText = "已停止"
+end
+
+--- 偵測效能核心數（與 transcribe.sh 的策略一致）
+local function detectPerfCores()
+  local out = runCommandSync("/usr/sbin/sysctl", {"-n", "hw.perflevel0.physicalcpu"})
+  local n = tonumber((out or ""):match("%d+"))
+  if not n then
+    out = runCommandSync("/usr/sbin/sysctl", {"-n", "hw.physicalcpu"})
+    n = tonumber((out or ""):match("%d+"))
+  end
+  if not n or n < 1 then n = 4 end
+  if n > 16 then n = 16 end
+  return n
+end
+
+local startServer  -- forward declaration（pollUntilReady 會遞迴用到）
+
+--- 輪詢直到 server 回應，或超過 SERVER_READY_TIMEOUT_SEC
+local function pollUntilReady(deadline)
+  if not serverTask then return end
+  checkServerHealth(function(alive)
+    if alive then
+      serverReady = true
+      serverStatusText = "就緒"
+      appendErrorLog("server: ready at " .. serverBaseURL()
+                     .. " model=" .. tostring(serverModelPath))
+      updateMenubar("🎤", "PTT Whisper v" .. VERSION .. " — Server 就緒")
+      return
+    end
+    if hs.timer.secondsSinceEpoch() >= deadline then
+      appendErrorLog("server: not ready within "
+                     .. SERVER_READY_TIMEOUT_SEC .. "s, falling back to CLI")
+      serverStatusText = "啟動逾時（本次改用 CLI）"
+      stopServer()
+      hs.alert.show("⚠️ whisper-server 啟動逾時，改用 CLI 模式", 3)
+      return
+    end
+    hs.timer.doAfter(SERVER_POLL_INTERVAL_SEC, function()
+      pollUntilReady(deadline)
+    end)
+  end)
+end
+
+startServer = function()
+  if not SERVER_MODE then return end
+  if serverTask then return end
+
+  local bin = findWhisperServerBin()
+  if not bin then
+    serverStatusText = "找不到 whisper-server"
+    appendErrorLog("server: whisper-server binary not found, using CLI")
+    return
+  end
+
+  local modelPath = resolveModelPath(nil)
+  if not modelPath then
+    serverStatusText = "找不到 model"
+    appendErrorLog("server: model not found, using CLI")
+    return
+  end
+
+  -- 埠已經有人在聽：可能是上次 Hammerspoon 沒正常收掉的殘留行程。
+  -- 我們無從得知它載入的是哪個模型，貿然使用可能拿到錯的轉錄結果，
+  -- 因此這種情況一律退回 CLI，由使用者決定要清掉它還是換 server_port。
+  checkServerHealth(function(alive)
+    if alive then
+      serverStatusText = string.format("埠 %d 已被占用（改用 CLI）", SERVER_PORT)
+      appendErrorLog(string.format(
+        "server: port %d already in use, refusing to start; using CLI", SERVER_PORT))
+      hs.alert.show(string.format(
+        "⚠️ 埠 %d 已被占用，改用 CLI 模式", SERVER_PORT), 3)
+      return
+    end
+
+    local args = {
+      "-m", modelPath,
+      "--host", SERVER_HOST,
+      "--port", tostring(SERVER_PORT),
+      "-t", tostring(WHISPER_THREADS > 0 and WHISPER_THREADS or detectPerfCores()),
+    }
+
+    -- VAD：同樣先確認這個 build 支援才帶上
+    if VAD_ENABLED ~= "false" then
+      local helpText = runCommandSync(bin, {"--help"}, {stderr = true}) or ""
+      if helpText:find("%-%-vad") then
+        local whisperDir = os.getenv("WHISPER_DIR")
+                           or (os.getenv("HOME") .. "/whisper.cpp")
+        local out = runCommandSync("/bin/ls", {whisperDir .. "/models"}) or ""
+        for line in out:gmatch("[^\n]+") do
+          if line:match("^ggml%-silero.*%.bin$") then
+            table.insert(args, "--vad")
+            table.insert(args, "--vad-model")
+            table.insert(args, whisperDir .. "/models/" .. line)
+            break
+          end
+        end
+      end
+    end
+
+    serverModelPath = modelPath
+    serverReady = false
+    serverStatusText = "啟動中…"
+
+    serverTask = hs.task.new(bin, function(exitCode, _, stderr)
+      -- server 自己掛掉（不是我們 terminate 的）
+      hs.timer.doAfter(0, function()
+        if serverTask then
+          appendErrorLog("server: exited unexpectedly exit=" .. tostring(exitCode)
+                         .. " stderr=" .. (stderr or ""):sub(1, 200))
+          serverTask = nil
+          serverReady = false
+          serverStatusText = "已結束（exit " .. tostring(exitCode) .. "）"
+        end
+      end)
+    end, function(_, _, stderr)
+      if stderr and stderr ~= "" then
+        appendErrorLog("server stderr: " .. stderr:sub(1, 200))
+      end
+      return true
+    end, args)
+
+    if serverTask:start() then
+      appendErrorLog("server: starting " .. bin .. " model=" .. modelPath)
+      pollUntilReady(hs.timer.secondsSinceEpoch() + SERVER_READY_TIMEOUT_SEC)
+    else
+      serverTask = nil
+      serverStatusText = "啟動失敗"
+      appendErrorLog("server: failed to start, using CLI")
+    end
+  end)
+end
+
+--- [SV1] 讀 transcribe.sh 寫下的後端標記。
+--- server 模式會靜默退回 CLI，沒有這個顯示使用者無從得知它到底有沒有在用。
+local function lastBackendLabel()
+  local f = io.open(PTT_DIR .. "/last_backend.txt", "r")
+  if not f then return "尚無記錄" end
+  local v = (f:read("*l") or ""):match("^%s*(.-)%s*$")
+  f:close()
+  if v == "server" then return "⚡ server" end
+  if v == "cli" then return "📼 CLI" end
+  return "尚無記錄"
+end
+
+local function restartServer()
+  stopServer()
+  hs.timer.doAfter(0.5, startServer)
+end
+
+PTTWhisper.startServer   = startServer
+PTTWhisper.stopServer    = stopServer
+PTTWhisper.restartServer = restartServer
 
 -- ── 統一失敗出口 ────────────────────────────────────────────
 local function abortToIdle(reason, opts)
@@ -922,7 +1257,8 @@ local function stopRecordingAndTranscribe()
   currentState = STATE.TRANSCRIBING
   updateMenubar("⏳", "PTT Whisper — Transcribing...")
   local savedClipboard = saveClipboard()
-  local langOverride, modelOverride, appName = getLangModelForCurrentApp()
+  local langOverride, modelOverride, appName, appPrompt = getLangModelForCurrentApp()
+  local promptText = buildPrompt(appPrompt)
 
   hs.timer.doAfter(FFMPEG_FLUSH_SEC, function()
     if sid ~= sessionCounter then return end
@@ -945,13 +1281,36 @@ local function stopRecordingAndTranscribe()
     end
 
     local env = {
-      PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+      -- [P3-1] 必須包含 /sbin：macOS 的 md5 在 /sbin/md5，
+      -- 少了它 transcribe.sh 算不出 AUDIO_HASH，cache_enabled 會靜默失效
+      PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
       HOME = os.getenv("HOME"),
     }
     if CACHE_ENABLED then env.WHISPER_CACHE = "true" end
     if FALLBACK_MODEL ~= "" then env.WHISPER_FALLBACK_MODEL = FALLBACK_MODEL end
+    -- [P3] 推理參數
+    if promptText ~= "" then env.WHISPER_PROMPT = promptText end
+    env.WHISPER_VAD = VAD_ENABLED
+    env.WHISPER_MAX_CONTEXT = tostring(MAX_CONTEXT)
+    -- 0 = 不指定，交給 transcribe.sh 依 CPU 自動偵測
+    if WHISPER_THREADS > 0 then
+      env.WHISPER_THREADS = tostring(WHISPER_THREADS)
+    end
+    -- [SV1] 只在 server 真的就緒時才叫 transcribe.sh 走 server；
+    -- 沒就緒就完全不提，讓它照原本的 CLI 路徑跑
+    if SERVER_MODE and serverTask and serverReady then
+      env.WHISPER_SERVER = "true"
+      env.WHISPER_SERVER_URL = serverBaseURL()
+      if serverModelPath then
+        env.WHISPER_SERVER_MODEL = serverModelPath
+      end
+    end
+    -- [MC2] WHISPER_CACHE_MAX 也要轉發，否則這個旋鈕只在直接執行
+    -- transcribe.sh 時有效，從 Hammerspoon 走完全接不到（永遠是預設 50）
     for _, k in ipairs({"WHISPER_DIR", "WHISPER_MODEL", "WHISPER_LANG",
-                        "WHISPER_TIMEOUT", "WHISPER_AUTO_RESAMPLE"}) do
+                        "WHISPER_TIMEOUT", "WHISPER_AUTO_RESAMPLE",
+                        "WHISPER_CACHE_MAX", "WHISPER_VAD_MODEL",
+                        "WHISPER_PROMPT_MAX_BYTES"}) do
       local v = os.getenv(k)
       if v then env[k] = v end
     end
@@ -1239,17 +1598,11 @@ local function runDiagnostics()
     if not modelPath then return "!預設 model 不存在" end
     local attr = hs.fs.attributes(modelPath)
     local sizeMB = attr and math.floor((attr.size or 0) / 1024 / 1024) or 0
-    -- [CR14] 標記模型類型，讓使用者一眼可辨是否正在使用量化版本
-    local tag
-    if modelPath:find("q5_0") then
-      tag = "Q5_0"
-    elseif modelPath:find("q5_1") then
-      tag = "Q5_1"
-    elseif modelPath:find("q8_0") then
-      tag = "Q8_0"
-    else
-      tag = "FP16"
-    end
+    -- [CR14][MC1] 標記模型類型，讓使用者一眼可辨是否正在使用量化版本
+    -- 通用比對檔名尾端的量化後綴（q5_1 / q5_0 / q8_0 / q4_k_m ...），
+    -- 比對不到就是未量化的 FP16
+    local suffix = modelPath:match("%-(q[%w_]+)%.bin$")
+    local tag = suffix and suffix:upper() or "FP16"
     return string.format("%s (%dMB) [%s]", modelPath, sizeMB, tag)
   end)
 
@@ -1369,6 +1722,96 @@ local function runDiagnostics()
     return "!" .. errLine
   end)
 
+  -- 15. [P3] whisper.cpp 旗標支援度
+  check("whisper.cpp 旗標", function()
+    local path = findWhisperBin()
+    if not path then return "!whisper.cpp 未安裝" end
+    local helpText = runCommandSync(path, {"--help"}, {stderr = true}) or ""
+    local supported, missing = {}, {}
+    for _, flag in ipairs({"--threads", "--max-context", "--prompt", "--vad"}) do
+      -- Lua pattern 需跳脫 "-"
+      if helpText:find(flag:gsub("%-", "%%-")) then
+        table.insert(supported, flag)
+      else
+        table.insert(missing, flag)
+      end
+    end
+    if #missing == 0 then
+      return "全部支援（" .. table.concat(supported, " ") .. "）"
+    end
+    -- 缺旗標不是錯誤：transcribe.sh 會自動略過不支援的項目
+    return string.format("支援 %s ／ 此 build 無 %s（會自動略過）",
+      table.concat(supported, " "), table.concat(missing, " "))
+  end)
+
+  -- 16. [P3] VAD
+  check("VAD", function()
+    if VAD_ENABLED == "false" then return "已停用（vad_enabled: false）" end
+    local whisperDir = os.getenv("WHISPER_DIR")
+                       or (os.getenv("HOME") .. "/whisper.cpp")
+    -- 與 transcribe.sh 一致：用 glob 掃描，不寫死 silero 版本號
+    local out = runCommandSync("/bin/ls", {whisperDir .. "/models"}) or ""
+    local vadModel = nil
+    for line in out:gmatch("[^\n]+") do
+      if line:match("^ggml%-silero.*%.bin$") then vadModel = line; break end
+    end
+    if not vadModel then
+      local hint = "!找不到 VAD model — cd " .. whisperDir
+                   .. " && bash ./models/download-vad-model.sh silero-v5.1.2"
+      -- auto 模式下沒有 model 只是「不啟用」，不算故障
+      if VAD_ENABLED == "auto" then
+        return "未啟用（無 VAD model）— 下載後 auto 模式會自動啟用"
+      end
+      return hint
+    end
+    local path = findWhisperBin()
+    if path then
+      local helpText = runCommandSync(path, {"--help"}, {stderr = true}) or ""
+      if not helpText:find("%-%-vad") then
+        return "!此 whisper.cpp build 不支援 --vad（請更新 whisper.cpp）"
+      end
+    end
+    return "啟用 — " .. vadModel
+  end)
+
+  -- 17. [P3] Initial prompt
+  check("Initial prompt", function()
+    local _, _, appName, appPrompt = getLangModelForCurrentApp()
+    local combined = buildPrompt(appPrompt)
+    if combined == "" then return "未設定" end
+    local preview, truncated = utf8Sub(combined, 40)
+    return string.format("%s%s（%d bytes，前景 App：%s）",
+      preview, truncated and "…" or "", #combined, appName)
+  end)
+
+  -- 18. [SV1] whisper-server
+  check("whisper-server", function()
+    if not SERVER_MODE then return "已停用（server_mode: false）" end
+    local bin = findWhisperServerBin()
+    if not bin then
+      return "!找不到 whisper-server — 需要 cmake --build 產出 build/bin/whisper-server"
+    end
+    if not serverTask then
+      return "!未執行 — " .. serverStatusText
+    end
+    if not serverReady then
+      return "!未就緒 — " .. serverStatusText
+    end
+    return string.format("%s — %s（model: %s）",
+      serverStatusText, serverBaseURL(), serverModelPath or "?")
+  end)
+
+  -- 19. [SV1] 上次實際使用的後端
+  check("上次轉錄後端", function()
+    local label = lastBackendLabel()
+    if label == "尚無記錄" then return "尚無記錄（還沒轉錄過）" end
+    -- 開了 server 卻一直走 CLI，代表有東西不對，值得提醒
+    if SERVER_MODE and label == "📼 CLI" then
+      return "!" .. label .. " — server_mode 已開啟但上次走的是 CLI，見 Error Log"
+    end
+    return label
+  end)
+
   -- 組裝報告
   local header = string.format(
     "=== PTT Whisper v%s Diagnostics ===\n%s\nMode: %s",
@@ -1415,6 +1858,8 @@ local function cleanup()
   resetStreamAccumulator()
   streamingFailCount = 0
   os.remove(RECORD_FILE)
+  -- [SV1] 一定要收掉常駐 server，否則 reload 後埠會被殘留行程占住
+  stopServer()
   if menubarItem then menubarItem:delete(); menubarItem = nil end
 end
 
@@ -1476,9 +1921,18 @@ if menubarItem then
         disabled = true },
       { title = "濾波器：" .. (AUDIO_FILTER_CHAIN ~= "" and "ON" or "OFF"),
         disabled = true },
+      { title = "Server：" .. (SERVER_MODE and serverStatusText or "OFF"),
+        disabled = true },
+      { title = "上次後端：" .. lastBackendLabel(), disabled = true },
       { title = langModelMenuLabel(), disabled = true },
       { title = "-" },
       { title = "🔍 Run Diagnostics", fn = function() runDiagnostics() end },
+      { title = "🔄 重啟 whisper-server",
+        disabled = not SERVER_MODE,
+        fn = function()
+          hs.alert.show("重啟 whisper-server…", 2)
+          restartServer()
+        end },
       { title = "-" },
       { title = "列出音訊裝置（Console）", fn = function()
           listAudioDevices()
@@ -1497,6 +1951,9 @@ if menubarItem then
               f:write('  "cache_enabled": false,\n')
               f:write('  "fallback_model": "",\n')
               f:write('  "audio_filter_chain": "highpass=f=200,lowpass=f=5000,loudnorm=I=-16:TP=-1.5",\n')
+              f:write('  "initial_prompt": "",\n')
+              f:write('  "vad_enabled": "auto",\n')
+              f:write('  "server_mode": false,\n')
               f:write('  "lang_models": {\n')
               f:write('    "_default": { "lang": "auto" }\n')
               f:write('  }\n')
@@ -1527,6 +1984,11 @@ end
 
 -- ── 熱鍵綁定 ────────────────────────────────────────────────
 hs.hotkey.bind(HOTKEY_MODS, HOTKEY_KEY, onKeyDown, onKeyUp)
+
+-- ── [SV1] 啟動常駐 server（server_mode = false 時直接 return）──
+-- 非同步：模型載入期間不阻塞 Hammerspoon 載入，
+-- 尚未就緒前的錄音會自動走 CLI 路徑
+startServer()
 
 -- ── 啟動提示 ────────────────────────────────────────────────
 local modeLabel = STREAMING_MODE and "⚡Streaming" or "📼Traditional"

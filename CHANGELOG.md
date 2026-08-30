@@ -1,36 +1,294 @@
-# PTT Whisper v3.5.1 / transcribe.sh v2.7.1 — Changelog
+# Changelog
 
-## 修正摘要
-
-根據 Code Review 報告的 3 個 Bug + 5 個改進建議，共計 10 項修正。
-
----
-
-### ptt_whisper.lua v3.5.0 → v3.5.1
-
-| 編號 | 類型 | 修正內容 |
-|------|------|----------|
-| R6 | 🔴 Bug Fix | Streaming fallback 改為漸進式降級（連續失敗 3 次才永久切換傳統模式），新增 `handleStreamingFailure()` 輔助函式與 `streamingFailCount` 計數器 |
-| R7 | 🟡 改進 | Streaming callback 現在會將 stderr 記錄到 log（截取前 200 字元），便於診斷 whisper.cpp 問題 |
-| R8 | 🟡 改進 | `cleanStreamOutput()` 改為合併所有非重複有效行（而非只取最後一行），避免長錄音時遺失前面的轉錄結果 |
-| R9 | 🟡 改進 | Config 載入加入 `streaming_step_ms`（100~10000）和 `streaming_length_ms`（1000~30000）範圍驗證，超出範圍時使用預設值並輸出警告 |
-| R10 | 🟢 小改進 | Log rotation 的 regex 改為精確匹配 `YYYYMMDD-HHMMSS` 格式（8+6 位數字），避免誤匹配 |
-
-**其他：**
-- 幻覺列表加入同步提醒註解（`⚠️ 注意：此列表需與 transcribe.sh 的內建列表保持同步`）
-- `cleanup()` 新增 `streamingFailCount` 重置
-- 內建幻覺列表補齊缺少的法文 Amara.org 條目（與 bash 端同步）
+本專案的所有重要變更都記錄於此。格式參考 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.1.0/)，
+版本號為 `ptt_whisper.lua` / `transcribe.sh` 兩者的對應版本。
 
 ---
 
-### transcribe.sh v2.7 → v2.7.1
+## [3.8.0] / transcribe.sh 2.10.0 — 常駐 Server
 
-| 編號 | 類型 | 修正內容 |
-|------|------|----------|
-| R1 | 🔴 Bug Fix | 快取 LRU 清理變數從 `local_cache_files` 重命名為 `cached_files`（消除語意混淆），並加入安全性註解說明 `ls` 解析在本專案 cache key 格式下是安全的 |
-| R2 | 🔴 Bug Fix | `run_whisper()` 中 `$tcmd` 加引號為 `"$tcmd"`，符合 `set -euo pipefail` 嚴格模式精神 |
-| R3 | 🟡 改進 | 快取 key 區塊加入限制說明註解：cache key 不含 whisper.cpp 版本，升級後建議清除快取 |
-| R4 | 🟢 小改進 | `stat` 檔案大小檢查加入跨平台相容性註解（macOS `-f%z` vs Linux `-c%s`） |
+CLI 模式每次錄音都要重新載入模型（small 量化版約 0.3~0.5 秒）。這是與講話
+長度無關的固定成本，對 2~15 秒的 PTT 錄音佔比很高。這版把 whisper-server
+接進來，模型常駐記憶體。
 
-**其他：**
-- 幻覺過濾區塊加入同步提醒註解（`⚠️ 注意：此內建列表需與 ptt_whisper.lua 的 builtinHallucinations 保持同步`）
+### Added
+
+- **`server_mode`（預設 `false`）**。啟用後由 `ptt_whisper.lua` 管理
+  whisper-server 的生命週期：Hammerspoon 載入時非同步啟動（模型載入期間
+  不阻塞，此時的錄音走 CLI），reload 時 `cleanup()` 收掉。
+  Menubar 新增「重啟 whisper-server」，Console API 新增
+  `PTTWhisper.restartServer()` / `stopServer()`。
+
+  預設關閉是刻意的：這會多一個長駐行程、常駐佔用約一份模型大小的 RAM。
+  這個交換該由使用者決定，不該在升級後自動出現。
+
+- **`server_port`（預設 `8178`）**。
+
+- **後端可見性**。`transcribe.sh` 每次會把實際用到的後端寫進
+  `~/.ptt-whisper/last_backend.txt`，Menubar 顯示「上次後端：⚡ server / 📼 CLI」，
+  Diagnostics 也有對應項目。**server 模式開著卻一直走 CLI 會被標成警告**——
+  這條路徑設計上會靜默降級，沒有這個顯示使用者不會發現它其實沒生效。
+
+### 降級策略
+
+server 只取代「跑推理」這一步；resample、幻覺過濾、快取、fallback model
+等管線完全不變，兩條路徑產出同一份 `${OUT_PREFIX}.txt`，下游不需要區分。
+
+任何一項不成立就退回 CLI：
+
+| 情況 | 行為 |
+|------|------|
+| server 未就緒 / 已掛掉（curl exit 7） | 該次走 CLI |
+| HTTP 非 200、回應為空 | 退回 CLI |
+| 回應是 JSON（舊版不支援 `response_format=text`） | 退回 CLI，不把 JSON 當結果 |
+| 本次模型 ≠ server 載入的模型 | 直接走 CLI，不發請求 |
+| 埠已被占用 | 不啟動 server，整個 session 走 CLI 並提示 |
+
+最後兩項的理由相同：為單次請求叫 server 換模型，會把「省下載入時間」的
+好處整個賠掉；而占用該埠的行程載入的是哪個模型無從得知，沿用可能拿到錯的
+轉錄結果。兩種情況都寧可退回 CLI。
+
+VAD 重試與 fallback model 一律留在 CLI 路徑上——那是已知穩定的路徑。
+
+### Fixed
+
+- 快取 key 納入 backend。server 與 CLI 對同一組參數理論上輸出相同，但
+  server 是否真的吃下 `prompt` / `max_context` 取決於它的版本，因此不假設
+  兩者等價，各自持有快取。
+
+---
+
+## [3.7.0] / transcribe.sh 2.9.0 — 推理參數
+
+whisper.cpp 的呼叫原本只帶了 `-m -f -otxt -of -nt`，把準確度與速度的旋鈕
+全留在桌上。這版把四個旗標接起來。
+
+### Added
+
+- **`--prompt`（術語注入）**。準確度收益最大的一項：把專有名詞、人名、
+  中英混用詞先餵給解碼器當上下文。兩層設定會**串接**：全域 `initial_prompt`
+  是通用術語表，`lang_models[bid].prompt` 是該 App 的領域術語，
+  這樣全域術語表在每個 App 都有效，不必逐個 App 重複貼一遍。
+  長度上限 800 bytes（≈266 中文字），超過從尾端截斷並記 WARNING。
+
+- **`--vad`（靜音偵測）**。砍掉靜音段：短錄音推理更快，且能**從源頭**減少
+  靜音幻覺——內建的幻覺黑名單是事後補救，VAD 是治本。
+  VAD model 以 glob 掃描 `models/ggml-silero*.bin`，不寫死版本號。
+  `vad_enabled` 預設 `"auto"`：whisper.cpp 支援且找得到 model 才啟用。
+
+- **`-t`（執行緒數）**。whisper.cpp 預設 `min(4, hardware_concurrency)`，
+  在 Apple Silicon 上偏保守。改為自動偵測**效能核心**數
+  （`hw.perflevel0.physicalcpu`）——把效率核心也算進來反而會拖慢推理。
+
+- **`-mc 0`（max-context）**。PTT 錄的是獨立短句，不需要跨段上下文；
+  關掉可明顯減少 whisper 的重複與拖尾幻覺。
+
+**能力偵測**：每個旗標都先確認這個 build 支援才帶上，舊版 whisper.cpp
+不會因為多了不認得的旗標而失敗。偵測結果快取在
+`~/.ptt-whisper/whisper_caps.txt`，以 binary 路徑 + mtime + size 為 key，
+重新編譯 whisper.cpp 會自動失效，不必每次錄音都跑一次 `--help`。
+
+**VAD 失敗的降級順序**：VAD 是最可能與環境衝突的一項（build 支援但 model
+檔損壞）。失敗時先**關掉 VAD 用同一個主模型重試**，再考慮換 fallback model
+——保住轉錄品質優先於保住流程。
+
+- Diagnostics 新增三項：whisper.cpp 旗標支援度、VAD 狀態、目前生效的
+  initial prompt（含前景 App）。
+
+### Fixed
+
+- **快取 key 納入 prompt / VAD / max-context**。這三者都會改變轉錄輸出，
+  不進 key 的話改了 prompt 會拿到舊 prompt 產生的快取結果。
+
+- **P3-1 — PATH 補上 `/sbin`，`cache_enabled` 才真的能運作**。
+  macOS 的 `md5` 位在 `/sbin/md5`，而 Lua 傳給 transcribe.sh 的 PATH 是
+  `/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin` — 找不到 `md5` 也找不到
+  `md5sum`，`AUDIO_HASH` 因此永遠是空字串，快取被靜默停用。也就是說
+  **F4 快取功能自 v3.5.0 引入以來，從 Hammerspoon 走的路徑上從未生效過**
+  （包括後續 R1、CR9、CR12 針對 LRU 清理做的所有修正）。
+  只有在終端機直接執行 `transcribe.sh` 時才會運作，因為互動式 shell
+  的 PATH 通常含 `/sbin`。
+
+### 設定
+
+```json
+{
+  "initial_prompt": "Kubernetes, Terraform, gRPC, PostgreSQL",
+  "vad_enabled": "auto",
+  "max_context": 0,
+  "whisper_threads": 0,
+  "lang_models": {
+    "com.tinyspeck.slackmacgap": { "lang": "en", "prompt": "standup, sprint, PR" }
+  }
+}
+```
+
+---
+
+## [3.6.5] / transcribe.sh 2.8.5
+
+### Fixed
+
+- **MC1 — 預設模型改為候選清單掃描**。舊版兩端都硬寫 `ggml-small-q5_0.bin`，
+  但 whisper.cpp 的 `download-ggml-model.sh` 對 small 只提供 **q5_1**
+  （q5_0 僅 medium / large 有），使用者照官方指令下載後反而吃不到量化版、
+  靜默退回 FP16。現在依偏好順序掃描：
+
+  ```
+  WHISPER_MODEL 環境變數（最高優先）
+    → ggml-small-q5_1.bin
+    → ggml-small-q5_0.bin
+    → ggml-small-q8_0.bin
+    → ggml-small.bin（FP16）
+  ```
+
+  清單在 `ptt_whisper.lua` 的 `DEFAULT_MODEL_CANDIDATES` 與 `transcribe.sh`
+  的 `DEFAULT_MODEL_CANDIDATES` 兩處，需保持一致。
+
+- Diagnostics 的模型類型標籤改為通用比對檔名量化後綴，
+  現在 `q4_k_m` 等格式也能正確標示（原本只認 q5_0 / q5_1 / q8_0）。
+
+- **MC2 — 轉發 `WHISPER_CACHE_MAX`**。Lua 端組裝 transcribe.sh 的環境變數時
+  漏了這一項，導致從 Hammerspoon 走的正常路徑永遠吃預設值 50，
+  只有直接在終端機執行 `transcribe.sh` 時才有效。
+
+### Added
+
+- 新增 `hallucinations_builtin.txt` 到 repo。此檔案自 v3.6.0（P1）起就是
+  兩端共用的幻覺列表來源，但從未隨 repo 提供，也沒有任何安裝步驟建立它，
+  因此實際上**兩端一直都在走硬編碼的 fallback 列表並記錄 WARNING**。
+  現在檔案隨 repo 提供，安裝步驟也加上部署指令。內容與兩端的硬編碼
+  fallback 完全一致（43 條）。
+
+### Docs
+
+- README 移除誤貼入的未整理草稿段落，重寫模型下載說明。
+- 四份分散的 changelog（`CHANGELOG.md`、`CHANGELOG_v3.6.2.md`、
+  `CHANGELOG_v3_6_3.md`、`CHANGELOG_v3_6_4.md`）合併為本檔案。
+- README 補上未被文件化的 `audio_filter_chain` 設定欄位。
+
+---
+
+## [3.6.4] / transcribe.sh 2.8.4 — 第四輪 Code Review
+
+### Fixed
+
+- **CR12** `loadExternalConfig()` 改為結構化回傳，Diagnostics 能區分
+  「無設定檔」/「空檔」/「JSON 解析失敗」三種情況。
+- **CR13** `streamingFailCount` 改為漸進式衰減（成功 -1，而非歸零）。
+  v3.6.2 的歸零讓降級保護被單次成功繞過，v3.6.3 的完全不衰減又會讓
+  跨越數小時的偶發失敗永久累積；遞減 1 在兩者間取得平衡。
+- **CR12-bash** LRU 快取清理的 `stat` 加入 Linux fallback
+  （`stat -f '%m %N'` 是 BSD 語法，Linux 上靜默失敗會導致快取無限增長）。
+
+### Added
+
+- **CR14** Diagnostics 的 Model 檢查加上量化版本標籤 `[Q5_0]` / `[FP16]`。
+- **CR15** Diagnostics 新增濾波器鏈 dry-run 驗證，用 `lavfi` 虛擬音源
+  在診斷時就抓出 `-af` 語法錯誤，不必等到實際錄音才發現。
+
+### Performance
+
+- **CR13-bash** 幻覺比對改為批次 normalize，fork 次數從 O(N) 降為 O(1)
+  （50 行列表：102 → 7 forks）。
+
+---
+
+## [3.6.3] / transcribe.sh 2.8.3 — 第三輪 Code Review
+
+### Fixed
+
+- **CR7** 修正工作目錄初始化順序：`loadExternalConfig()` 原本在
+  `mkdir(PTT_DIR)` 之前呼叫，導致首次啟動讀不到 config.json。
+- **CR8** 錄音濾波器 lowpass 從 3kHz 放寬到 **5kHz**。3kHz 切掉了齒擦音
+  頻帶（/s/、/ʃ/、/f/ 約 4–8kHz），對英文辨識有負面影響。
+- **CR9** `streamingFailCount` 不再於每次成功啟動時歸零
+  （後於 v3.6.4 再調整為漸進式衰減）。
+- **CR9-bash** LRU 快取清理從 `ls -1t` 改用 `find`，消除空目錄時
+  glob 不展開的邊界問題。
+
+### Added
+
+- **CR10** Diagnostics 納入 config 驗證警告，設定錯誤一次可見。
+
+### Performance
+
+- **CR7-bash** `normalize_text()` 合併 sed pipeline，單次呼叫 fork 7 → 2。
+
+### Docs
+
+- **CR11** FFmpeg 收到 SIGINT 在 macOS 回傳 255 屬正常終止，加註解說明。
+- **CR10-bash** 文件化 `LC_ALL=C` 的 trade-off：字元類只匹配 ASCII，
+  全形空白 U+3000 需在 `normalize_text()` 中顯式處理。
+
+---
+
+## [3.6.2] / transcribe.sh 2.8.2 — 錄音品質 + 推理效能
+
+### Added
+
+- **OPT1 — 聲學濾波器鏈**。錄音的 ffmpeg 呼叫加入 `-af`：
+
+  | 濾波器 | 作用 |
+  |--------|------|
+  | `highpass=f=200` | 切除冷氣、馬路隆隆聲等低頻環境噪音 |
+  | `lowpass=f=5000` | 切除電路嘶聲、風扇雜音（v3.6.3 由 3000 放寬） |
+  | `loudnorm=I=-16:TP=-1.5` | EBU R128 感知響度正規化，防止忽大忽小 |
+
+  可透過 config.json 的 `audio_filter_chain` 覆寫，設為 `""` 停用。
+  Streaming 模式由 whisper.cpp 自行擷取麥克風，不經過 ffmpeg，故不受影響。
+
+- **OPT2 — 預設改用量化模型**。
+
+  | 指標 | FP16 | Q5 量化版 |
+  |------|------|-----------|
+  | 檔案大小 | ~466 MB | ~181 MB (-61%) |
+  | 記憶體佔用 | ~500 MB | ~200 MB (-60%) |
+  | 推理速度 | 1x | 2~3x |
+  | 準確率 | 基準 | 幾乎無損（<0.5% WER 差異） |
+
+  量化將關鍵張量壓縮進 L3 cache，把 memory-bound 運算轉為 compute-bound。
+  （此版寫死 q5_0，於 v3.6.5 修正為候選清單掃描。）
+
+---
+
+## 更早的版本
+
+- **3.6.1** / 2.8.1 — CR1~CR6（第二輪 Code Review）
+- **3.6.0** / 2.8.0 — P1~P6：共用幻覺列表檔、Streaming 累積上限
+- **3.5.1** / 2.7.1 — R1~R10：Streaming 漸進式降級、快取 LRU 修正、
+  config 範圍驗證、log rotation regex 精確化
+- **3.5.0** / 2.7 — F4~F7：轉錄快取、Streaming 模式、Fallback Model、健康檢查
+- **3.4.x** / 2.6.x — F1~F3：多語言 / 多 App 切換
+- **3.3.x** ~ **2.1** — 早期迭代（詳見 git history）
+
+---
+
+## Known Issues
+
+### whisper.cpp `-nt`（no timestamps）可能丟字
+
+**狀態**：已知，暫不修正。
+
+whisper.cpp issue [#2186](https://github.com/ggerganov/whisper.cpp/issues/2186)
+報告 `-nt` 在長音訊（>30s）上可能導致部分語句被丟棄。PTT Whisper 的典型
+錄音時長為 2~15 秒，觸發機率極低，目前保留 `-nt` 以維持輸出簡潔。
+
+**未來方案**：若出現丟字回報，改用帶 timestamp 的輸出 + sed strip。
+
+---
+
+## Roadmap
+
+### FFmpeg 8.0 `af_whisper` 原生整合
+
+**狀態**：追蹤中，暫不採用。
+
+FFmpeg 8.0「Huffman」(2025-08-22) 新增 `af_whisper` 濾鏡，理論上可用單一
+命令完成錄音 → 濾波 → 推理，砍掉整個 `transcribe.sh`。暫不採用的原因：
+
+1. Homebrew FFmpeg formula 尚未包含 `--enable-whisper` build option
+2. `af_whisper` 不支援 streaming mode
+3. 穩定性未經社群充分驗證
+
+**評估時機**：Homebrew formula 支援，或 FFmpeg 8.1 發佈時。
