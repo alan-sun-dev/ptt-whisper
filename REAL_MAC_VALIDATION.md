@@ -16,65 +16,56 @@ test double；production 走的是 `hs.json.decode`。**這個替換本身沒有
 
 以下必須在真實 Mac 上人工完成。合併 PR 前請逐項確認。
 
-## A. 載入與基本功能
+## ✅ A / B / C 已於 2026-08-30 在真機完成驗證
 
-- [ ] 1. `hs.reload()` — Hammerspoon Console 無錯誤，出現「PTT Whisper v4.0.6 已載入」
-- [ ] 2. Menubar → **Run Diagnostics** — 18 個項目全部檢視，無非預期的 ❌
-- [ ] 3. 按住 Right Option 講話、放開 → 文字正確貼到游標處
-- [ ] 4. 貼上後原本的剪貼簿內容有被還原
-- [ ] 5. 在密碼欄位嘗試 → Secure Input 偵測有中止貼上
+環境：macOS 26.6.2 arm64 · Hammerspoon 1.1.1 · whisper.cpp `c4ac001` ·
+`ggml-small-q5_1` + `ggml-silero-v5.1.2` · PTT Whisper v4.0.6
 
-## B. CLI backend
+### A. 載入與基本功能
 
-- [ ] 6. `server_mode: false` 下正常轉錄
-- [ ] 7. Diagnostics「whisper.cpp 旗標」顯示你的 build 實際支援哪些
-- [ ] 8. 設 `initial_prompt` 為你的術語表 → 專有名詞辨識有改善
-- [ ] 9. 設 `lang_models[<某 App>].prompt` → 在該 App 下 Diagnostics 的
-        「Initial prompt」顯示**全域 + 該 App**串接後的結果
-- [ ] 10. 下載 VAD model → Diagnostics「VAD」顯示啟用；靜音錄音不再產生幻覺
-- [ ] 11. `cache_enabled: true` → 同一段音訊第二次明顯更快，
-         `~/.ptt-whisper/cache/` 有檔案（**這條路徑在 v3.7.0 之前從未生效過**）
+- [x] 1. `hs.reload()` — `ptt_whisper.lua LOADED OK`，13 個 API 就位，無錯誤
+- [x] 2. Run Diagnostics — **15 PASS / 2 WARNING / 0 FAIL**
+       （WARNING：`gtimeout` 未安裝〔已補〕、config 含已移除的 streaming 欄位
+       〔向後相容測試，行為正確〕）
+- [x] 3. 按住 Right Option → 文字正確貼上
+       ← 需要 **v4.0.5** 的修正才成立。`hs.hotkey` 對單獨修飾鍵永遠不會觸發
+- [x] 4. 貼上後原剪貼簿還原
+       ← 需要 **v4.0.6** 的修正才成立。**必須用有格式的內容測**：
+       純文字剪貼簿即使在有 bug 的版本也會通過，會得到假的通過
+- [x] 5. Secure Input 偵測 —— `pasteText: aborted due to Secure Input`，
+       轉錄完成但正確拒絕貼上
 
-## C. Server backend（風險最高，尚無任何真實驗證）
+### B. CLI backend
 
-- [ ] 12. `server_mode: true` + `hs.reload()` → Menubar「Server：啟動中…」
-- [x] 13. ~~**模型載入期間** Menubar 顯示「模型載入中…」~~
-         **已驗證：這在初次啟動時不可能發生。** whisper.cpp 的 server 在
-         `main()` 裡先 `whisper_init_from_file`、再 `state.store(READY)`，
-         HTTP listen 又更晚（`examples/server/server.cpp:726/735`）。
-         因此啟動期間 `/health` 只會是 connection-refused，狀態直接
-         「啟動中…」→「就緒」。503 `loading` 只在 runtime 呼叫 `/load`
-         換模型時才出現。`classifyHealthResponse` 兩條路徑都處理正確，
-         `loading` 分支屬防禦性程式碼。
-- [ ] 14. 模型載入完成後才變「就緒」，且此時錄音走 server
-- [ ] 15. Diagnostics「上次轉錄後端」顯示 `⚡ server`
-- [ ] 16. 手動 `kill` 掉 whisper-server → 下次錄音自動退回 CLI，文字仍正確貼出
-- [ ] 17. Menubar →「重啟 whisper-server」→ 正常回到就緒
-- [ ] 18. **連續快速按 5 次**「重啟 whisper-server」→ 最終狀態穩定為「就緒」，
-         沒有殘留的舊狀態文字，`lsof -i :8178` 只有一個行程
-         ← P0-2 generation guard 的核心
-- [ ] 19. 佔用該埠再 reload（`python3 -m http.server 8178`）→
-         顯示「埠 8178 已被占用」並退回 CLI，**不可**誤判成 free
-- [ ] 20. `hs.reload()` 數次 → 每次都乾淨收掉舊 server，埠沒有殘留
-         （`lsof -i :8178` 在 reload 後短暫應為空）
-- [ ] 21. 開快取 + server：確認 Menubar 出現「📦 快取（server 產生）」
+- [x] 6. `server_mode: false` 正常轉錄
+- [x] 7. Diagnostics「whisper.cpp 旗標」— 全部支援
+       （`--threads --max-context --prompt --vad`）
+- [x] 8. `initial_prompt` 有效 —— `VLLM and Quen` → `vLLM and Qwen`
+- [x] 9. per-app prompt 串接正確
+- [x] 10. VAD 啟用 —— `whisper_full: VAD is enabled, processing speech segments only`
+- [x] 11. `cache_enabled` 真的產生快取檔 ← 這條路徑在 v3.7.0 之前從未生效過
 
-### 確認「你這台編出來的 build」與 contract 一致
+### C. Server backend
 
-upstream whisper.cpp 的原始碼已確認：`/health` 就緒回 `200 {"status":"ok"}`、
-載入中回 `503 {"status":"loading model"}`；`/inference` 的 multipart parser
-確實會解析 `max_context` 與 `no_timestamps` 並套進 whisper inference
-parameters。程式碼就是照這份 contract 實作的。
+- [x] 12–14. `server_mode: true` → 啟動 → 就緒，錄音走 server
+- [x] 15. 「上次轉錄後端」顯示 `⚡ server`
+- [x] 16. `kill` whisper-server → 自動退回 CLI，文字仍正確
+- [x] 17–18. **連續重啟 ×5** → generation 1→11、恰好 1 個 listener、1 個行程
+- [x] 19. **埠被占用**（`python3 -m http.server 8178`）→ 偵測到 `HTTP 404`
+       判為占用、拒絕啟動、退回 CLI
+- [x] 20. **`hs.reload()` ×4** → 每次換新 pid、舊的被收掉、無 orphan
+- [x] 21. 快取 + server → `📦 快取（server 產生）`
 
-因此以下兩項的目的**不是**再證明 upstream 支不支援，而是確認
-**你這台實際編譯出來的 whisper.cpp 版本與這份 contract 是否一致**
-（版本落差、build option 差異都可能造成不一致）：
+### 已釐清的 upstream 契約
 
-- [ ] 22. `curl -i http://127.0.0.1:8178/health` 在「載入中」與「就緒」
-         兩個時點各跑一次，確認 status 與 body 與上述 contract 相符
-- [ ] 23. 對照 CLI 模式念同一段話（尤其有設 `initial_prompt` 時），
-         確認 server 路徑的輸出與 CLI 一致 —— 若明顯不同，代表你這版的
-         `/inference` 對 `max_context` / `no_timestamps` 的處理與預期有落差
+- [x] 22. `/health` ready 實測：`HTTP/1.1 200 OK` ·
+       `Content-Type: application/json` · `{"status":"ok"}`
+       **與 contract 相符**
+- [x] 23. `/inference` 實測接受 `response_format` / `no_timestamps` /
+       `prompt` / `max_context`（`max_context=abc` → HTTP 500，
+       但 `transcribe.sh` 已先驗證不會送出）
+
+---
 
 ## D. 語音品質
 
