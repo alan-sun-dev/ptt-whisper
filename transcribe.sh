@@ -76,7 +76,12 @@ else
   : "${MODEL:=$WHISPER_DIR/models/ggml-small.bin}"
 fi
 LANGUAGE="${WHISPER_LANG:-auto}"
+# [H1] TIMEOUT_SEC 必須先驗證成數字。非數字的值會讓後面的 (( TIMEOUT_SEC > 0 ))
+# 在 set -u 下把它當變數名解析，直接 "unbound variable" 中止整個腳本。
 TIMEOUT_SEC="${WHISPER_TIMEOUT:-60}"
+if [[ ! "$TIMEOUT_SEC" =~ ^[0-9]+$ ]]; then
+  TIMEOUT_SEC=60
+fi
 AUTO_RESAMPLE="${WHISPER_AUTO_RESAMPLE:-true}"
 
 # [F4] 快取設定
@@ -483,21 +488,25 @@ run_whisper_server() {
   local body_tmp http_code curl_rc first
   body_tmp=$(mktemp "$PTT_DIR/ptt_server_XXXXXX.tmp") || return 1
 
+  # [H2] 只有音訊檔用 -F（需要 @ 的檔案語意）；其餘一律 --form-string。
+  # curl 的 -F 會把值裡的 @ 當「上傳這個本機檔案」、< 當「從檔案讀入內容」，
+  # 而 prompt 完全可能合法地以 @ 或 < 開頭（"@channel"、"<tag>"）。
+  # 用 -F 傳 prompt 等於把本機檔案內容送到 server，必須永遠當字面值處理。
   local args=(
     -s -o "$body_tmp" -w '%{http_code}'
     --max-time "$TIMEOUT_SEC"
     -F "file=@${EFFECTIVE_AUDIO}"
-    -F "response_format=text"
-    -F "no_timestamps=true"
+    --form-string "response_format=text"
+    --form-string "no_timestamps=true"
   )
   if [[ -n "$LANGUAGE" && "$LANGUAGE" != "auto" ]]; then
-    args+=(-F "language=$LANGUAGE")
+    args+=(--form-string "language=$LANGUAGE")
   fi
   if [[ -n "$PROMPT" ]]; then
-    args+=(-F "prompt=$PROMPT")
+    args+=(--form-string "prompt=$PROMPT")
   fi
   if [[ -n "$MAX_CONTEXT" ]]; then
-    args+=(-F "max_context=$MAX_CONTEXT")
+    args+=(--form-string "max_context=$MAX_CONTEXT")
   fi
 
   curl_rc=0

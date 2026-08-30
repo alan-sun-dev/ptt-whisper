@@ -122,9 +122,11 @@ local WHISPER_THREADS = 0
 local SERVER_MODE = false
 local SERVER_PORT = 8178
 local SERVER_HOST = "127.0.0.1"
--- 模型載入可能要好幾秒，啟動後輪詢到就緒為止
+-- 模型載入可能要好幾秒，啟動後輪詢 /health 到就緒為止
 local SERVER_READY_TIMEOUT_SEC = 20
 local SERVER_POLL_INTERVAL_SEC = 0.4
+-- 重啟時等待舊行程真正結束的上限
+local SERVER_STOP_TIMEOUT_SEC  = 5
 
 local WHISPER_SERVER_BIN_CANDIDATES = {
   "/build/bin/whisper-server",
@@ -710,13 +712,25 @@ local function restoreClipboard(saved)
 end
 
 -- ── [SV1] whisper-server 生命週期 ───────────────────────────
--- 狀態：serverTask 存在 = 我們啟動的行程還活著；
---       serverReady = HTTP 已經回應過（模型載入完成）；
---       serverModelPath = server 載入的模型，用來判斷請求能否走 server。
+-- 狀態不變式：
+--   serverGeneration —— 每次 start / stop / 非預期結束都會 +1。
+--                       所有非同步 callback（process exit、health 探測、
+--                       poll timer、restart 等待）都在排程時 capture 當下的
+--                       generation，觸發時若已不相符就直接 return，
+--                       絕不碰任何 server 全域狀態。
+--   serverTask       —— 目前這一代的行程；nil = 沒有我們啟動的 server
+--   serverReady      —— /health 回報模型已載入完成（不只是「port 有回應」）
+--   serverStatusText —— 永遠對應「目前 generation」的狀態
 local serverTask       = nil
 local serverReady      = false
 local serverModelPath  = nil
 local serverStatusText = "未啟用"
+local serverGeneration = 0
+
+local function bumpGeneration()
+  serverGeneration = serverGeneration + 1
+  return serverGeneration
+end
 
 local function serverBaseURL()
   return string.format("http://%s:%d", SERVER_HOST, SERVER_PORT)
@@ -734,25 +748,91 @@ local function findWhisperServerBin()
   return nil
 end
 
---- 非同步健康檢查：任何 HTTP 回應都算「有人在聽」（404 也算）
---- @param callback function(alive: boolean)
-local function checkServerHealth(callback)
-  hs.http.asyncGet(serverBaseURL() .. "/", nil, function(status)
-    -- status < 0 = 連線失敗；>= 100 = 有 HTTP 回應
-    callback(status ~= nil and status >= 100)
+-- [TESTABLE:classifyHealthResponse] ← tests/test-lua-units.lua 會抽出這段獨立執行
+--- 把 GET /health 的結果分類。純函式，不碰任何全域狀態，方便單獨測試。
+---
+--- 決策表：
+---   連線失敗 (status nil 或 < 100)      → "unavailable"  沒有東西在這個 port
+---   200 + body 含 status 且含 ok        → "ready"        whisper-server 模型已就緒
+---   200 + 其他 body                     → "foreign"      有 HTTP 服務，但不是就緒的 whisper-server
+---   503                                 → "loading"      whisper-server 在載入模型（行程活著但還不能用）
+---   其他 HTTP status（403/404/500…）    → "foreign"      有東西在聽，但不是有效的 whisper-server
+---
+--- 關鍵區分：
+---   "行程活著"（loading / foreign）  ≠  "模型可用"（ready）
+---   "port 空著"（unavailable）       ≠  "port 被別的服務占用"（foreign）
+--- @return string state, string detail
+local function classifyHealthResponse(status, body)
+  if status == nil or status < 100 then
+    return "unavailable", "connection failed"
+  end
+  body = body or ""
+  if status == 200 then
+    local lowered = body:lower()
+    if lowered:find("status", 1, true) and lowered:find("ok", 1, true) then
+      return "ready", body:sub(1, 120)
+    end
+    return "foreign", "HTTP 200 但 /health 回應不像 whisper-server: " .. body:sub(1, 120)
+  end
+  if status == 503 then
+    return "loading", body:sub(1, 120)
+  end
+  return "foreign", "HTTP " .. tostring(status)
+end
+-- [/TESTABLE]
+
+--- Readiness 探測：專門回答「whisper 模型能不能用」
+--- @param callback function(state: string, detail: string)
+local function probeServerReadiness(callback)
+  hs.http.asyncGet(serverBaseURL() .. "/health", nil, function(status, body)
+    callback(classifyHealthResponse(status, body))
   end)
 end
 
-local function stopServer()
-  if serverTask then
-    pcall(function()
-      if serverTask:isRunning() then serverTask:terminate() end
-    end)
-    serverTask = nil
-  end
-  serverReady = false
+--- Endpoint 占用探測：專門回答「這個 port 上是不是已經有東西在聽」
+--- 與 readiness 刻意分開：任何 HTTP 回應（含 404、500）都代表被占用，
+--- 不能因為 /health 回 404 就誤判成「port 是空的」而去啟動並 bind 失敗。
+--- @param callback function(occupied: boolean, detail: string)
+local function probeEndpointOccupancy(callback)
+  hs.http.asyncGet(serverBaseURL() .. "/health", nil, function(status)
+    local state = classifyHealthResponse(status, nil)
+    if state == "unavailable" then
+      callback(false, "no listener")
+    else
+      callback(true, state .. " (HTTP " .. tostring(status) .. ")")
+    end
+  end)
+end
+
+--- 停止 server。先 bump generation，讓所有在途 callback 立刻失效，
+--- 再終止行程 —— 順序不能顛倒，否則 terminate 觸發的 exit callback
+--- 會用舊 generation 通過檢查。
+--- @return userdata|nil 被停掉的 task（供 restart 等待其真正結束）
+local function stopServer(statusText)
+  bumpGeneration()
+  local task = serverTask
+  serverTask      = nil
+  serverReady     = false
   serverModelPath = nil
-  serverStatusText = "已停止"
+  serverStatusText = statusText or "已停止"
+  if task then
+    pcall(function()
+      if task:isRunning() then task:terminate() end
+    end)
+  end
+  return task
+end
+
+--- 等待行程真正結束（而不是 sleep 固定秒數然後祈禱）
+local function waitForTaskExit(task, deadline, callback)
+  if not task then callback(true); return end
+  local running = false
+  pcall(function() running = task:isRunning() end)
+  if not running then callback(true); return end
+  if hs.timer.secondsSinceEpoch() >= deadline then callback(false); return end
+  hs.timer.doAfter(SERVER_POLL_INTERVAL_SEC, function()
+    waitForTaskExit(task, deadline, callback)
+  end)
 end
 
 --- 偵測效能核心數（與 transcribe.sh 的策略一致）
@@ -768,13 +848,19 @@ local function detectPerfCores()
   return n
 end
 
-local startServer  -- forward declaration（pollUntilReady 會遞迴用到）
+local startServer  -- forward declaration（restart 會用到）
 
---- 輪詢直到 server 回應，或超過 SERVER_READY_TIMEOUT_SEC
-local function pollUntilReady(deadline)
+--- 輪詢 /health 直到模型就緒，或超過 deadline。
+--- gen 是這一代的 generation；每個進入點與 callback 都先比對，
+--- 不相符就結束 —— 這同時保證「重複 restart 不會累積多個 poll loop」。
+local function pollUntilReady(gen, deadline)
+  if gen ~= serverGeneration then return end
   if not serverTask then return end
-  checkServerHealth(function(alive)
-    if alive then
+
+  probeServerReadiness(function(state, detail)
+    if gen ~= serverGeneration then return end
+
+    if state == "ready" then
       serverReady = true
       serverStatusText = "就緒"
       appendErrorLog("server: ready at " .. serverBaseURL()
@@ -782,16 +868,29 @@ local function pollUntilReady(deadline)
       updateMenubar("🎤", "PTT Whisper v" .. VERSION .. " — Server 就緒")
       return
     end
+
+    if state == "loading" then
+      serverStatusText = "模型載入中…"
+    elseif state == "foreign" then
+      -- 我們啟動的行程活著，但 /health 回的不是就緒的 whisper-server 格式。
+      -- 啟動早期可能如此，因此繼續輪詢，但絕不標成 ready。
+      serverStatusText = "等待有效的 /health 回應…"
+      appendErrorLog("server: unexpected /health — " .. tostring(detail))
+    else
+      serverStatusText = "等待行程接受連線…"
+    end
+
     if hs.timer.secondsSinceEpoch() >= deadline then
-      appendErrorLog("server: not ready within "
-                     .. SERVER_READY_TIMEOUT_SEC .. "s, falling back to CLI")
-      serverStatusText = "啟動逾時（本次改用 CLI）"
-      stopServer()
+      appendErrorLog(string.format(
+        "server: not ready within %ds (last state=%s), falling back to CLI",
+        SERVER_READY_TIMEOUT_SEC, state))
+      stopServer("啟動逾時（改用 CLI）")
       hs.alert.show("⚠️ whisper-server 啟動逾時，改用 CLI 模式", 3)
       return
     end
+
     hs.timer.doAfter(SERVER_POLL_INTERVAL_SEC, function()
-      pollUntilReady(deadline)
+      pollUntilReady(gen, deadline)
     end)
   end)
 end
@@ -814,14 +913,21 @@ startServer = function()
     return
   end
 
-  -- 埠已經有人在聽：可能是上次 Hammerspoon 沒正常收掉的殘留行程。
-  -- 我們無從得知它載入的是哪個模型，貿然使用可能拿到錯的轉錄結果，
-  -- 因此這種情況一律退回 CLI，由使用者決定要清掉它還是換 server_port。
-  checkServerHealth(function(alive)
-    if alive then
+  local gen = bumpGeneration()
+  serverStatusText = "檢查埠…"
+
+  -- 先確認 port 沒被占用。這是「占用偵測」，與「模型就緒偵測」是兩件事：
+  -- 佔著這個 port 的可能是別的 HTTP 服務，也可能是上次沒收乾淨的殘留行程。
+  -- 兩種情況我們都無從得知它載入的是哪個模型，貿然使用可能拿到錯的結果，
+  -- 因此一律不啟動、退回 CLI，由使用者決定要清掉它還是換 server_port。
+  probeEndpointOccupancy(function(occupied, detail)
+    if gen ~= serverGeneration then return end
+
+    if occupied then
       serverStatusText = string.format("埠 %d 已被占用（改用 CLI）", SERVER_PORT)
       appendErrorLog(string.format(
-        "server: port %d already in use, refusing to start; using CLI", SERVER_PORT))
+        "server: port %d already occupied [%s], refusing to start; using CLI",
+        SERVER_PORT, tostring(detail)))
       hs.alert.show(string.format(
         "⚠️ 埠 %d 已被占用，改用 CLI 模式", SERVER_PORT), 3)
       return
@@ -853,19 +959,21 @@ startServer = function()
     end
 
     serverModelPath = modelPath
-    serverReady = false
+    serverReady     = false
     serverStatusText = "啟動中…"
 
-    serverTask = hs.task.new(bin, function(exitCode, _, stderr)
-      -- server 自己掛掉（不是我們 terminate 的）
+    local task
+    task = hs.task.new(bin, function(exitCode, _, stderr)
       hs.timer.doAfter(0, function()
-        if serverTask then
-          appendErrorLog("server: exited unexpectedly exit=" .. tostring(exitCode)
-                         .. " stderr=" .. (stderr or ""):sub(1, 200))
-          serverTask = nil
-          serverReady = false
-          serverStatusText = "已結束（exit " .. tostring(exitCode) .. "）"
-        end
+        -- 舊 server 的 exit callback 絕不能改到新 server 的狀態
+        if gen ~= serverGeneration then return end
+        appendErrorLog("server: exited unexpectedly exit=" .. tostring(exitCode)
+                       .. " stderr=" .. (stderr or ""):sub(1, 200))
+        serverTask  = nil
+        serverReady = false
+        serverStatusText = "已結束（exit " .. tostring(exitCode) .. "）"
+        -- bump 讓同代的 poll loop 立刻停止
+        bumpGeneration()
       end)
     end, function(_, _, stderr)
       if stderr and stderr ~= "" then
@@ -874,10 +982,14 @@ startServer = function()
       return true
     end, args)
 
-    if serverTask:start() then
-      appendErrorLog("server: starting " .. bin .. " model=" .. modelPath)
-      pollUntilReady(hs.timer.secondsSinceEpoch() + SERVER_READY_TIMEOUT_SEC)
+    serverTask = task
+
+    if task:start() then
+      appendErrorLog("server: starting " .. bin .. " model=" .. modelPath
+                     .. " gen=" .. gen)
+      pollUntilReady(gen, hs.timer.secondsSinceEpoch() + SERVER_READY_TIMEOUT_SEC)
     else
+      if gen ~= serverGeneration then return end
       serverTask = nil
       serverStatusText = "啟動失敗"
       appendErrorLog("server: failed to start, using CLI")
@@ -897,14 +1009,35 @@ local function lastBackendLabel()
   return "尚無記錄"
 end
 
+--- 重啟：等舊行程真正結束再啟動，而不是 sleep 固定秒數然後祈禱。
 local function restartServer()
-  stopServer()
-  hs.timer.doAfter(0.5, startServer)
+  local task = stopServer("重啟中…")
+  local gen = serverGeneration
+  waitForTaskExit(task, hs.timer.secondsSinceEpoch() + SERVER_STOP_TIMEOUT_SEC,
+    function(exited)
+      -- 等待期間若又有人 stop/start，這次重啟就作廢
+      if gen ~= serverGeneration then return end
+      if not exited then
+        appendErrorLog(string.format(
+          "server: previous process still running after %ds; starting anyway "
+          .. "(port bind may fail, will fall back to CLI)", SERVER_STOP_TIMEOUT_SEC))
+      end
+      startServer()
+    end)
 end
 
 PTTWhisper.startServer   = startServer
 PTTWhisper.stopServer    = stopServer
 PTTWhisper.restartServer = restartServer
+PTTWhisper.serverState   = function()
+  return {
+    generation = serverGeneration,
+    ready      = serverReady,
+    status     = serverStatusText,
+    model      = serverModelPath,
+    running    = serverTask ~= nil,
+  }
+end
 
 -- ── 統一失敗出口 ────────────────────────────────────────────
 local function abortToIdle(reason, opts)
