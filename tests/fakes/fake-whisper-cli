@@ -41,8 +41,15 @@ for bad in ${FAKE_FAIL_MODELS:-}; do
 done
 
 if [[ -n "${FAKE_ECHO_MODEL:-}" ]]; then
-  echo "from:$mb" > "$of.txt"
+  text="from:$mb"
 else
-  echo "${FAKE_TEXT:-hello world}" > "$of.txt"
+  text="${FAKE_TEXT:-hello world}"
 fi
+
+echo "$text" > "$of.txt"
+
+# [B1] 真實的 whisper-cli 會「同時」把文字印到 stdout 和寫進 -otxt 檔案。
+# fake 之前只寫檔，所以「transcribe.sh 沒導掉 stdout 導致輸出重複」這個
+# bug 逃過了整套測試，直到真機驗證才被抓到。這裡忠實模擬。
+printf '\n %s\n' "$text"
 exit 0

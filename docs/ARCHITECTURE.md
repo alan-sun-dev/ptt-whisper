@@ -179,8 +179,12 @@ Bash 的硬編碼 fallback。後兩者是完整的 43 條複本。
 runtime copy → repo copy → **最小**緊急 fallback（只留最常見的幾條），
 兩端都不再維護完整複本。
 
-### 3. `max_context: 0` 尚未經真實語料驗證
+### 3. `max_context` 的抗幻覺效果尚未驗證
 
-預設值是理論推導（PTT 是獨立短句、關掉可減少重複與拖尾幻覺），
-但沒有跑過真實 whisper.cpp 的 A/B。保持 configurable，
-文件已明確標註尚待 benchmark。見 `REAL_MAC_VALIDATION.md` 第 30 項。
+`max_context: 0` 曾是預設值，理由是「關掉跨段上下文可減少重複與拖尾幻覺」。
+真機 A/B 已證實它會讓 `initial_prompt` 完全失效，因此預設已改為 `-1`
+（不帶 `-mc`）。
+
+但**「關掉 context 能減少重複／拖尾幻覺」這個原始假設本身仍未被驗證**——
+只證明了它的副作用不可接受。若日後要重新評估，需要涵蓋不同長度與語言的
+語料做 A/B，並同時觀察術語命中率的損失。見 `REAL_MAC_VALIDATION.md`。

@@ -18,7 +18,7 @@ test double；production 走的是 `hs.json.decode`。**這個替換本身沒有
 
 ## A. 載入與基本功能
 
-- [ ] 1. `hs.reload()` — Hammerspoon Console 無錯誤，出現「PTT Whisper v4.0.3 已載入」
+- [ ] 1. `hs.reload()` — Hammerspoon Console 無錯誤，出現「PTT Whisper v4.0.4 已載入」
 - [ ] 2. Menubar → **Run Diagnostics** — 18 個項目全部檢視，無非預期的 ❌
 - [ ] 3. 按住 Right Option 講話、放開 → 文字正確貼到游標處
 - [ ] 4. 貼上後原本的剪貼簿內容有被還原
@@ -38,9 +38,14 @@ test double；production 走的是 `hs.json.decode`。**這個替換本身沒有
 ## C. Server backend（風險最高，尚無任何真實驗證）
 
 - [ ] 12. `server_mode: true` + `hs.reload()` → Menubar「Server：啟動中…」
-- [ ] 13. **模型載入期間** Menubar 顯示「模型載入中…」而**不是**「就緒」
-         ← P0-1 的核心。若這裡沒有出現「模型載入中…」，表示**你這台編出來的
-         whisper.cpp** 的 `/health` 回應與目前 contract 不一致，請把實際回應貼給我
+- [x] 13. ~~**模型載入期間** Menubar 顯示「模型載入中…」~~
+         **已驗證：這在初次啟動時不可能發生。** whisper.cpp 的 server 在
+         `main()` 裡先 `whisper_init_from_file`、再 `state.store(READY)`，
+         HTTP listen 又更晚（`examples/server/server.cpp:726/735`）。
+         因此啟動期間 `/health` 只會是 connection-refused，狀態直接
+         「啟動中…」→「就緒」。503 `loading` 只在 runtime 呼叫 `/load`
+         換模型時才出現。`classifyHealthResponse` 兩條路徑都處理正確，
+         `loading` 分支屬防禦性程式碼。
 - [ ] 14. 模型載入完成後才變「就緒」，且此時錄音走 server
 - [ ] 15. Diagnostics「上次轉錄後端」顯示 `⚡ server`
 - [ ] 16. 手動 `kill` 掉 whisper-server → 下次錄音自動退回 CLI，文字仍正確貼出

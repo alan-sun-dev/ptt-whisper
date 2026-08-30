@@ -201,7 +201,7 @@ Hammerspoon Console → hs.reload()
 | `audio_filter_chain` | string | 見下方 | 錄音時的 FFmpeg `-af` 濾波器鏈，設為 `""` 停用 |
 | `initial_prompt` | string | `""` | 全域術語表（見「術語注入」）|
 | `vad_enabled` | bool 或 `"auto"` | `"auto"` | 靜音偵測。`auto` = 支援且有 model 才啟用 |
-| `max_context` | number | `0` | 跨段上下文 token 數，有效 0~224。見下方說明 |
+| `max_context` | number | `-1` | 跨段上下文 token 數。`-1` = 用 whisper 預設。**設 0 會讓 `initial_prompt` 失效**，見下方 |
 | `whisper_threads` | number | `0` | 推理執行緒數，有效 0~16。`0` = 自動偵測 |
 | `server_mode` | bool | `false` | 啟用常駐 whisper-server（見「常駐 Server 模式」）|
 | `server_port` | number | `8178` | Server 監聽埠，有效 1024~65535 |
@@ -218,16 +218,33 @@ Hammerspoon Console → hs.reload()
 可填入任何合法的 FFmpeg `-af` 參數。改動後用 Menubar → **Run Diagnostics**
 確認語法正確（診斷會以 `lavfi` 虛擬音源做 dry-run 驗證）。
 
-#### 關於 `max_context: 0`
+#### 關於 `max_context`
 
-預設值 `0` 的理由是：PTT 錄的是獨立短句，不需要跨段上下文，關掉**理論上**
-可減少 whisper 的重複與拖尾幻覺。
+**預設 `-1`（不帶 `-mc`，使用 whisper 自己的預設值）。**
 
-**這尚未經過真實 whisper.cpp 的 A/B 驗證**，不要當成已證實的最佳值。
-要驗證需要涵蓋 2–3 秒 / 5–15 秒 / 20–30 秒，中文、英文、中英混用、
-技術術語、口語自我修正等語料，比較 CER/WER、術語命中率、重複、
-拖尾幻覺與延遲。若你的實測結果不同，把它調回 whisper 預設即可
-（設為空字串或移除該欄位就不會帶 `-mc` 旗標）。
+早期版本預設為 `0`，理由是「PTT 錄的是獨立短句，關掉跨段上下文可減少重複
+與拖尾幻覺」。**真機 A/B 證實那是錯的**：`-mc 0` 會清空 text context，
+而 initial prompt 的 token 就活在 text context 裡——兩者同時設定時
+`initial_prompt` **完全失效**。
+
+同一段音訊、同一組 prompt（`Claude Code, Docker, Kubernetes, vLLM, Qwen, gRPC`）：
+
+| 設定 | 輸出 |
+|---|---|
+| 有 prompt、`max_context: -1` | `Cloud Code … **vLLM** and **Qwen**` ✅ |
+| 有 prompt、`max_context: 0` | `cloud code … **VLLM** and **Quen**` ❌ prompt 沒作用 |
+| 有 prompt、`max_context: 64` | `Cloud Code … **vLLM** and **Qwen**` ✅ |
+
+由於術語注入是準確度收益最大的功能，預設不能犧牲它。
+
+若你同時設了 `initial_prompt` 與 `max_context: 0`，載入時會收到明確警告，
+Run Diagnostics 的「config.json 驗證」也看得到。
+
+**「關掉 context 能減少重複／拖尾幻覺」這個假設本身仍未經完整驗證**，
+需要涵蓋 2–3 秒 / 5–15 秒 / 20–30 秒，中文、英文、中英混用、技術術語、
+口語自我修正等語料的 A/B。若你實測後認為值得，可以設 `max_context: 0`
+並改用 `lang_models` 的 per-app prompt 而非全域 prompt——但要清楚知道
+這是拿術語準確度換取抗重複。
 
 ### 環境變數
 
@@ -497,8 +514,8 @@ rm -rf ~/.ptt-whisper/cache/
 詳見 [CHANGELOG.md](CHANGELOG.md)
 
 **當前版本：**
-- `ptt_whisper.lua` v4.0.3
-- `transcribe.sh` v2.10.1
+- `ptt_whisper.lua` v4.0.4
+- `transcribe.sh` v2.10.2
 
 ---
 

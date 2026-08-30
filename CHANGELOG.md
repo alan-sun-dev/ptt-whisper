@@ -5,6 +5,81 @@
 
 ---
 
+## [4.0.4] / transcribe.sh 2.10.2 — 真機驗證抓到的兩個 blocker
+
+兩個問題都通過了 191 條自動化斷言，只有在真實 Mac 上跑真實 whisper.cpp
+才暴露出來。
+
+### Fixed — CLI 路徑輸出重複
+
+每一次 CLI 轉錄，文字都會被輸出**兩次**：
+
+```
+This is a PTT Whisper Runtime Test.This is a PTT Whisper Runtime Test.
+```
+
+`whisper-cli` 會**同時**把轉錄文字印到 stdout **和**寫進 `-otxt` 指定的
+檔案，而 `run_whisper()` 只導走 stderr，stdout 直接漏到腳本輸出，再加上
+結尾正常的 `printf "$result"`。
+
+```
+whisper-cli stdout : '\n This is a PTT Whisper Runtime Test.'
+-otxt 檔案內容      : 'This is a PTT Whisper Runtime Test.'
+```
+
+修正：`run_whisper()` 的兩處執行都加 `>/dev/null`。唯一的真實來源是
+`${OUT_PREFIX}.txt`。server 路徑不受影響（curl `-o` 寫檔）。
+
+**這個 bug 自初版（`ebfd32b`）就存在**，不是這輪重構引入的。
+
+**為什麼 191 條測試沒抓到**：`fake-whisper-cli` 只寫檔、不印 stdout，
+與真實行為偏離。這是測試套件自己的缺陷，已一併修正——fake 現在忠實地
+同時印 stdout 與寫檔，並新增 `tests/cases/05-output-integrity.sh`
+（6 條斷言，涵蓋 CLI / server / server 失敗退回 CLI 三條路徑）。
+移除修正後該組測試會失敗，雙向驗證過。
+
+### Fixed — `max_context: 0` 讓 `initial_prompt` 完全失效
+
+`-mc 0` 會清空 text context，而 initial prompt 的 token 就活在裡面。
+兩者都是 v3.7.0 的預設值，**互相抵銷**——被描述為「準確度最大的槓桿」
+的功能，在出貨預設值下是關閉的。
+
+真機 A/B（同一段音訊、同一組 prompt）：
+
+| 設定 | 輸出 |
+|---|---|
+| 有 prompt、無 `-mc` | `Cloud Code … **vLLM** and **Qwen**` ✅ |
+| 有 prompt、`-mc 0` | `cloud code … **VLLM** and **Quen**` ❌ |
+| 有 prompt、`-mc 64` | `Cloud Code … **vLLM** and **Qwen**` ✅ |
+
+CLI 端 `-mc 0` 甚至更糟：`VLLM and Quint Speech Recognition`。
+
+修正：
+
+- `max_context` 預設由 `0` 改為 `-1`（= 不帶 `-mc`，用 whisper 預設）
+- 有效範圍由 `0~224` 改為 `-1~224`；負數一律視為「不帶旗標」
+- 同時設定 `initial_prompt` 與 `max_context: 0` 時，載入會發出明確警告，
+  Run Diagnostics 的「config.json 驗證」也看得到
+- 明確設定 `0` 仍會被尊重（帶 `-mc 0`）——那是使用者的選擇
+
+「關掉 context 能減少重複／拖尾幻覺」這個**原始假設本身仍未被驗證**，
+只證明了它的副作用不可接受。README 與 ARCHITECTURE 的措辭已同步修正。
+
+### Docs
+
+- `REAL_MAC_VALIDATION.md` 第 13 項標記為**已驗證**，並修正期待：
+  503 `loading` 在初次啟動時不可觀察。whisper.cpp 的 server 先載入模型
+  （`server.cpp:726`）、再 `state.store(READY)`（735），HTTP listen 更晚，
+  因此啟動期間只會是 connection-refused，狀態直接「啟動中…」→「就緒」。
+  503 只在 runtime 呼叫 `/load` 換模型時出現。`classifyHealthResponse`
+  兩條路徑都處理正確，`loading` 分支屬防禦性程式碼。
+
+### Testing
+
+`./tests/run.sh` → **191 passed, 0 failed, 0 skipped**（前一版 181）。
+
+---
+
 ## [4.0.3] / transcribe.sh 2.10.1 — 測試套件的 merge-gate 語意
 
 ### Changed

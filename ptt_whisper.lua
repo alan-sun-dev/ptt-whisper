@@ -1,6 +1,12 @@
 -- ============================================================
 -- Push-to-Talk Whisper Dictation for Hammerspoon
--- v4.0.3
+-- v4.0.4
+--
+-- v4.0.4 修正（真機驗證抓到的兩個 blocker）：
+--   B1.[Fix] CLI 路徑輸出重複 —— whisper-cli 同時印 stdout 與寫 -otxt，
+--            run_whisper 只導 stderr，導致文字被貼兩次（自初版就存在）
+--   B2.[Fix] max_context 預設由 0 改為 -1 —— -mc 0 會讓 initial_prompt
+--            完全失效，兩個 v3.7.0 的預設值互相抵銷
 --
 -- v4.0.3：測試套件的 merge-gate 語意（lua 成為必要依賴）
 --
@@ -46,11 +52,11 @@
 -- v3.0：E~K  v2.1：A~D
 --
 -- 使用方式：按住 Right Option 錄音，放開後自動轉錄並貼上
--- 依賴：ffmpeg、whisper.cpp 已編譯、~/ptt-whisper/transcribe.sh v2.10.1+
+-- 依賴：ffmpeg、whisper.cpp 已編譯、~/ptt-whisper/transcribe.sh v2.10.2+
 -- ============================================================
 
 -- ── 版本常數 ────────────────────────────────────────────────
-local VERSION = "4.0.3"
+local VERSION = "4.0.4"
 
 -- ── 設定區（Config）──────────────────────────────────────────
 
@@ -124,8 +130,12 @@ local INITIAL_PROMPT = ""
 -- "auto" = whisper.cpp 支援且找得到 VAD model 才啟用
 local VAD_ENABLED = "auto"
 
--- max-context：PTT 是獨立短句，不需跨段上下文；0 可減少重複／拖尾幻覺
-local MAX_CONTEXT = 0
+-- max-context：-1 = 不帶此旗標，使用 whisper 自己的預設值。
+--
+-- [B2] 曾經預設為 0。真機 A/B 證實那會讓 initial_prompt 完全失效——
+-- -mc 0 清空 text context，而 initial prompt 的 token 就活在裡面。
+-- 兩者都是 v3.7.0 的預設值，互相抵銷。詳見 README「關於 max_context」。
+local MAX_CONTEXT = -1
 
 -- 執行緒數：0 = 交給 transcribe.sh 自動偵測（Apple Silicon 取效能核心數）
 local WHISPER_THREADS = 0
@@ -319,14 +329,20 @@ local function validateConfig(config)
     end
   end
 
-  -- [P3] max_context: number, 0~224（whisper 的 n_text_ctx/2）
+  -- [P3][B2] max_context: number, -1~224
+  --   -1  = 不帶 -mc，使用 whisper 預設（推薦，才不會讓 initial_prompt 失效）
+  --   0~224 = 明確指定
   if config.max_context ~= nil then
     if type(config.max_context) == "number"
-       and config.max_context >= 0
+       and config.max_context >= -1
        and config.max_context <= 224 then
       MAX_CONTEXT = math.floor(config.max_context)
+      if MAX_CONTEXT == 0 and INITIAL_PROMPT ~= "" then
+        warn("max_context=0 會讓 initial_prompt 完全失效（-mc 0 清空 text "
+             .. "context，prompt token 就在裡面）。若要用術語注入請改為 -1 或 >0")
+      end
     else
-      warn("max_context: expected number in 0~224")
+      warn("max_context: expected number in -1~224 (-1 = whisper 預設)")
     end
   end
 
@@ -1400,7 +1416,10 @@ local function stopRecordingAndTranscribe()
     -- [P3] 推理參數
     if promptText ~= "" then env.WHISPER_PROMPT = promptText end
     env.WHISPER_VAD = VAD_ENABLED
-    env.WHISPER_MAX_CONTEXT = tostring(MAX_CONTEXT)
+    -- [B2] 只有明確設定 0~224 才帶；-1 表示交給 whisper 預設
+    if MAX_CONTEXT >= 0 then
+      env.WHISPER_MAX_CONTEXT = tostring(MAX_CONTEXT)
+    end
     -- 0 = 不指定，交給 transcribe.sh 依 CPU 自動偵測
     if WHISPER_THREADS > 0 then
       env.WHISPER_THREADS = tostring(WHISPER_THREADS)

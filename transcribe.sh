@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================
-# transcribe.sh v2.10.1 — PTT Whisper 轉錄腳本
+# transcribe.sh v2.10.2 — PTT Whisper 轉錄腳本
 #
-# 搭配 ptt_whisper.lua v4.0.1 使用
+# 搭配 ptt_whisper.lua v4.0.4 使用
 # 用法：transcribe.sh /path/to/audio.wav [language] [model_path]
 #   language   — 覆寫 WHISPER_LANG（如 en, zh, ja）
 #                空字串 "" 或 "auto" = 不帶 -l，讓 whisper.cpp 自行偵測
@@ -11,6 +11,12 @@
 #                空字串 "" = 使用預設
 #   prompt     — 覆寫 WHISPER_PROMPT（initial prompt，注入術語/人名）
 # 輸出：轉錄文字寫到 stdout（單行，去頭尾空白，含 trailing newline）
+#
+# v2.10.2 修正（真機驗證抓到）：
+#  B1.[Fix]   run_whisper 導掉 stdout —— whisper-cli 同時印 stdout 與寫
+#             -otxt，不導掉會讓轉錄文字被輸出兩次
+#  B2.[Fix]   MAX_CONTEXT 預設由 0 改為「不帶旗標」—— -mc 0 會讓
+#             initial prompt 完全失效
 #
 # v2.10.1 強化：
 #  H1.[Fix]   curl multipart 除音訊檔外一律用 --form-string（@ / < 字面值）
@@ -112,9 +118,17 @@ PROMPT_MAX_BYTES="${WHISPER_PROMPT_MAX_BYTES:-800}"
 # VAD：true / false / auto（auto = 支援且有 VAD model 才啟用）
 VAD_MODE="${WHISPER_VAD:-auto}"
 
-# max-context：PTT 錄音是獨立短句，不需要跨段上下文。
-# 設 0 可明顯減少 whisper 的重複／拖尾幻覺。留空 = 不帶此旗標。
-MAX_CONTEXT="${WHISPER_MAX_CONTEXT:-0}"
+# max-context：預設「不帶」此旗標，使用 whisper 自己的預設值。
+#
+# [B2] 曾經預設為 0，這是錯的：-mc 0 會清空 text context，而 initial prompt
+# 的 token 就活在 text context 裡 —— 兩者同時設定時 initial_prompt 會「完全
+# 失效」。真機實測（同一段音訊、同一組 prompt）：
+#     有 prompt、無 -mc  → "Cloud Code ... vLLM and Qwen"   ✅
+#     有 prompt、-mc 0   → "cloud code ... VLLM and Quen"   ❌ prompt 沒作用
+#     有 prompt、-mc 64  → "Cloud Code ... vLLM and Qwen"   ✅
+# 由於 initial prompt 是準確度收益最大的功能，預設不能犧牲它。
+# 空字串 = 不帶旗標；設定 0~224 才會帶。
+MAX_CONTEXT="${WHISPER_MAX_CONTEXT:-}"
 
 # threads：留空 = 自動偵測（Apple Silicon 取效能核心數）
 THREADS="${WHISPER_THREADS:-}"
@@ -284,6 +298,10 @@ if (( THREADS > 16 )); then THREADS=16; fi
 
 # ── [P3] max-context 驗證 ────────────────────────────────────
 # 有效範圍 0~224（whisper 的 n_text_ctx/2）。非數字或超界則不帶此旗標。
+# 負數（含 -1）視為「使用 whisper 預設」，同樣不帶旗標。
+if [[ "$MAX_CONTEXT" == -* ]]; then
+  MAX_CONTEXT=""
+fi
 if [[ -n "$MAX_CONTEXT" ]]; then
   if [[ ! "$MAX_CONTEXT" =~ ^[0-9]+$ ]] || (( MAX_CONTEXT > 224 )); then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: invalid WHISPER_MAX_CONTEXT='$MAX_CONTEXT', ignoring" >> "$LOG_FILE" 2>/dev/null || true
@@ -521,14 +539,18 @@ run_whisper() {
 
   rm -f "${OUT_PREFIX}.txt" 2>/dev/null || true
 
+  # [B1] stdout 必須丟掉。whisper-cli 會「同時」把轉錄文字印到 stdout
+  # 和寫進 -otxt 指定的檔案；本腳本自己的 stdout 就是最終輸出，
+  # 不導掉的話 whisper 的那份會漏出去，使用者會看到文字被貼兩次。
+  # 唯一的真實來源是 ${OUT_PREFIX}.txt。
   if [[ -n "$tcmd" ]]; then
-    "$tcmd" "$TIMEOUT_SEC" "${cmd[@]}" 2>>"$LOG_FILE" && return 0
+    "$tcmd" "$TIMEOUT_SEC" "${cmd[@]}" >/dev/null 2>>"$LOG_FILE" && return 0
     return $?
   else
     if (( TIMEOUT_SEC > 0 )); then
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: timeout not found" >> "$LOG_FILE"
     fi
-    "${cmd[@]}" 2>>"$LOG_FILE" && return 0
+    "${cmd[@]}" >/dev/null 2>>"$LOG_FILE" && return 0
     return $?
   fi
 }

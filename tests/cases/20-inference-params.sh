@@ -4,7 +4,8 @@ echo "  [B] 推理參數"
 
 t_reset_log; t_run >/dev/null
 assert_contains "自動偵測執行緒數 -t" "$(t_args)" "-t "
-assert_contains "預設帶 -mc 0"        "$(t_args)" "-mc 0"
+# [B2] 預設「不」帶 -mc：-mc 0 會讓 initial_prompt 完全失效（真機 A/B 證實）
+assert_not_contains "預設不帶 -mc（使用 whisper 預設）" "$(t_args)" "-mc"
 
 t_reset_log; t_run "WHISPER_PROMPT=gRPC, Kubernetes" >/dev/null
 assert_contains "prompt 帶入 --prompt" "$(t_args)" "--prompt gRPC, Kubernetes"
@@ -13,7 +14,18 @@ t_reset_log; t_run "WHISPER_THREADS=3" >/dev/null
 assert_contains "WHISPER_THREADS 覆寫" "$(t_args)" "-t 3"
 
 t_reset_log; t_run "WHISPER_MAX_CONTEXT=64" >/dev/null
-assert_contains "WHISPER_MAX_CONTEXT 覆寫" "$(t_args)" "-mc 64"
+assert_contains "明確設定 64 → 帶 -mc 64" "$(t_args)" "-mc 64"
+
+t_reset_log; t_run "WHISPER_MAX_CONTEXT=0" >/dev/null
+assert_contains "明確設定 0 → 仍尊重使用者，帶 -mc 0" "$(t_args)" "-mc 0"
+
+t_reset_log; t_run "WHISPER_MAX_CONTEXT=-1" >/dev/null
+assert_not_contains "-1 = whisper 預設 → 不帶旗標" "$(t_args)" "-mc"
+
+# 預設值下 prompt 必須真的被送出（B2 的核心：兩者不可互相抵銷）
+t_reset_log; t_run "WHISPER_PROMPT=Qwen vLLM" >/dev/null
+assert_contains     "預設下 prompt 有送出" "$(t_args)" "--prompt Qwen vLLM"
+assert_not_contains "預設下不會同時帶 -mc 把 prompt 抵銷掉" "$(t_args)" "-mc"
 
 t_reset_log; t_run "WHISPER_MAX_CONTEXT=999" >/dev/null
 assert_not_contains "max_context 超界(>224) → 不帶旗標" "$(t_args)" "-mc"
