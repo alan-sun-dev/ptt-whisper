@@ -184,5 +184,24 @@ if obsPath then
   end
 end
 
+-- ── [HK1] maskIsSet：修飾鍵左右辨識的位元判斷 ─────────────
+local maskChunk = extract(readAll(srcPath), "maskIsSet") .. "\nreturn maskIsSet\n"
+local maskIsSet = assert(loader(maskChunk, "maskIsSet"))()
+
+local RALT, LALT, RSHIFT = 0x40, 0x20, 0x04
+check("右 Option 單獨按下 → 有設",        maskIsSet(RALT, RALT), true)
+check("只按左 Option → 右 Option 未設",   maskIsSet(LALT, RALT), false)
+check("左右 Option 同時 → 右 Option 有設", maskIsSet(RALT + LALT, RALT), true)
+check("左右 Option 同時 → 左 Option 有設", maskIsSet(RALT + LALT, LALT), true)
+check("放開全部 → 未設",                  maskIsSet(0, RALT), false)
+check("其他修飾鍵不會誤判成右 Option",     maskIsSet(RSHIFT, RALT), false)
+-- 真實 CGEventFlags 會同時含有粗粒度位元（alt = 0x00080000）
+check("含粗粒度 alt 位元時仍能分辨右 Option",
+      maskIsSet(0x00080000 + RALT, RALT), true)
+check("含粗粒度 alt 位元但實際是左 Option",
+      maskIsSet(0x00080000 + LALT, RALT), false)
+check("flags 為 nil → false（不誤觸發）",  maskIsSet(nil, RALT), false)
+check("mask 為 0 → false",                 maskIsSet(RALT, 0), false)
+
 print(string.format("-- lua units: %d passed, %d failed", pass, fail))
 os.exit(fail == 0 and 0 or 1)

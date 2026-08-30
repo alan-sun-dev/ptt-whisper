@@ -5,6 +5,77 @@
 
 ---
 
+## [4.0.5] — 真機聽寫實測抓到的問題
+
+實際按住熱鍵講話才會暴露的問題。前面所有自動化測試與 headless 驗證都無法觸及。
+
+### Fixed — Right Option 熱鍵完全沒反應
+
+按住 Right Option 沒有任何反應，log 一行都沒有增加。
+
+`hs.hotkey` 底層是 Carbon 的 `RegisterEventHotKey`，它**不會對單獨按下的
+修飾鍵觸發**——macOS 對修飾鍵送的是 `flagsChanged` 事件，不是 keyDown/keyUp。
+`hs.hotkey.bind({}, "rightalt", ...)` 會「註冊成功」但永遠不會被呼叫。
+
+改用 `hs.eventtap` 監聽 `flagsChanged`：
+
+- 用 IOKit 的裝置特定遮罩（右 Option = `0x40`）分辨左右。
+  `getFlags().alt` 不分左右，左右同時按會誤判
+- 非修飾鍵仍走 `hs.hotkey`（對一般按鍵它是正確且更省資源的做法）
+- 回傳 `false` 不吞掉事件，其他 App 照常收到該修飾鍵
+- `cleanup()` 收掉 eventtap，避免 reload 累積多個 tap
+
+遮罩判斷抽成純函式 `maskIsSet` 並加上 10 條單元測試（含左右同時按住、
+含粗粒度 alt 位元、其他修飾鍵不誤判等）。
+
+### Fixed — 短按產生 0 bytes 錄音
+
+三輪真機測試三次命中：
+
+```
+[17:08:09] killTask: SIGINT timeout, sent SIGTERM → 錄音檔過小（0 bytes）
+[17:18:09] killTask: SIGINT timeout, sent SIGTERM → 錄音檔過小（0 bytes）
+[17:27:10] killTask: SIGINT timeout, sent SIGTERM → 錄音檔過小（0 bytes）
+```
+
+實測 ffmpeg 收到 SIGINT 後需要 **0.7~0.9 秒**才寫完並收尾 WAV：
+
+```
+按住 0.4s → 19174 bytes（實際耗時 1.31s）
+按住 0.6s → 18720 bytes（實際耗時 1.27s）
+按住 0.4s → 14414 bytes（實際耗時 1.26s）
+```
+
+但原本 `KILL_FALLBACK_SEC = 0.5` 會在收尾中途送 SIGTERM 砍掉它，
+而 `FFMPEG_FLUSH_SEC = 0.3` 又在寫完之前就去檢查檔案。
+
+修正不是把常數調大猜一個值，而是**等 ffmpeg 行程真正結束再檢查**
+（沿用 server 重啟用的 `waitForTaskExit`）。`KILL_FALLBACK_SEC` 一併拉到
+2.0 秒，不再打斷正常收尾。
+
+### Docs — README 三處建議修正（皆有真機證據）
+
+- **刪掉「initial_prompt 只放詞彙，不要放句子」。** 這條建議正是中文輸出
+  沒有標點的原因：
+
+  | initial_prompt | 中文輸出標點 |
+  |---|---|
+  | 純詞彙表（無句末標點） | **完全沒有**（3 段皆是） |
+  | 自然中文句子含 `，、？。` | **完整**（2 段皆是） |
+
+  英文沒有這個差異（三種 prompt 風格輸出完全相同），推測是中文標點在小模型
+  上較弱、更依賴 prompt 的風格引導。
+
+- **新增「詞彙表外的詞會被吸附」。** 實測講 `Typeless`（不在表內）被辨識成
+  `Kubernetes`（表內）。把該詞加進 prompt 後即正確辨識。這不是 bug，是
+  initial prompt 的固有機制。
+
+- **新增「不要依賴 `lang: auto`」。** 實測講中文被判成英文，且輸出被**翻譯**
+  成英文（「我要測試中文語音辨識」→ `I want to test Chinese language.`）。
+  明確設 `"lang": "zh"` 後正常。
+
+---
+
 ## [4.0.4] / transcribe.sh 2.10.2 — 真機驗證抓到的兩個 blocker
 
 兩個問題都通過了 191 條自動化斷言，只有在真實 Mac 上跑真實 whisper.cpp

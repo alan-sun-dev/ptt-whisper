@@ -205,7 +205,7 @@ Hammerspoon Console → hs.reload()
 | `whisper_threads` | number | `0` | 推理執行緒數，有效 0~16。`0` = 自動偵測 |
 | `server_mode` | bool | `false` | 啟用常駐 whisper-server（見「常駐 Server 模式」）|
 | `server_port` | number | `8178` | Server 監聽埠，有效 1024~65535 |
-| `lang_models` | object | `{}` | 依 App Bundle ID 切換語言/模型/prompt |
+| `lang_models` | object | `{}` | 依 App Bundle ID 切換語言/模型/prompt。**主要講中文請明確設 `"lang": "zh"`，不要用 `"auto"`** |
 
 `audio_filter_chain` 預設值為 `highpass=f=200,lowpass=f=5000,loudnorm=I=-16:TP=-1.5`：
 
@@ -402,6 +402,25 @@ whisper.cpp 在靜音或極短音訊上常會「幻覺」出訓練資料中的�
 比對是兩層的：先原文精確比對，再 normalize（全形→半形、去除尾端標點、
 轉小寫）後比對，因此不需要為標點與大小寫的變體重複列出。
 
+### 語言設定：不要依賴 `auto`
+
+`lang_models` 的 `"lang": "auto"` 會讓 whisper 自己猜語言。真機實測：講中文
+被判成英文，而且輸出被**翻譯**成英文——
+
+```
+你說：我要測試中文語音辨識
+輸出：I want to test Chinese language.
+```
+
+短句尤其容易誤判。**主要講中文就明確指定：**
+
+```json
+{ "lang_models": { "_default": { "lang": "zh" } } }
+```
+
+改成 `zh` 之後同樣的話就正常輸出中文了。`auto` 只適合真的需要多語言自動切換
+的情境，而且建議搭配較大的模型。
+
 ### 術語注入（Initial Prompt）
 
 whisper 對專有名詞、人名、中英混用詞的辨識率不高——「gRPC」會變成
@@ -429,8 +448,29 @@ whisper 對專有名詞、人名、中英混用詞的辨識率不高——「gRP
 - prompt 受 whisper 的 `n_text_ctx/2`（約 224 tokens）限制，過長反而會擠掉
   真正的解碼上下文。預設上限 800 bytes（約 266 個中文字 / 130 個英文單字），
   超過會從尾端截斷並在 log 留下 WARNING。
-- 只放**詞彙**，不要放句子或指令 — whisper 的 prompt 不是 LLM 的 system prompt，
-  寫「請使用繁體中文」不會有效果，語言請用 `lang_models` 指定。
+- **prompt 的「風格」會被模仿，不只是詞彙。** 真機實測（中文、`ggml-small-q5_1`）：
+
+  | initial_prompt | 中文輸出的標點 |
+  |---|---|
+  | 純詞彙表 `Claude Code, Docker, Kubernetes`（無句末標點） | **完全沒有標點**（3 段皆是） |
+  | 自然中文句子，含 `，、？。` | **標點完整**（2 段皆是） |
+
+  所以**建議寫成一句包含你常用術語的自然句子**，而不是逗號分隔的詞彙表：
+
+  ```json
+  "initial_prompt": "我今天用 Typeless 做語音輸入，順便測試 Claude Code、Docker、Kubernetes、vLLM 和 Qwen 這些術語辨識得如何？效果還不錯。"
+  ```
+
+  英文則沒有觀察到這個差異（三種 prompt 風格的標點輸出完全相同），
+  推測是中文標點在小模型上較弱、更依賴 prompt 的風格引導。
+
+- **詞彙表外的專有名詞會被「吸附」到表內最接近的詞。** 真機實測：講
+  `Typeless`（不在表內）被辨識成 `Kubernetes`（表內）。這不是 bug，是
+  initial prompt 的固有機制——把你真正會講的詞放進去才是解法，
+  而不是放一堆用不到的詞。
+
+- prompt 不是 LLM 的 system prompt，寫「請使用繁體中文」不會有效果，
+  語言請用 `lang_models` 指定（見下方）。
 - prompt 會進快取 key，改了 prompt 不會拿到舊結果。
 
 ### VAD（靜音偵測）
@@ -514,7 +554,7 @@ rm -rf ~/.ptt-whisper/cache/
 詳見 [CHANGELOG.md](CHANGELOG.md)
 
 **當前版本：**
-- `ptt_whisper.lua` v4.0.4
+- `ptt_whisper.lua` v4.0.5
 - `transcribe.sh` v2.10.2
 
 ---

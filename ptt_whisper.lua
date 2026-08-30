@@ -1,6 +1,14 @@
 -- ============================================================
 -- Push-to-Talk Whisper Dictation for Hammerspoon
--- v4.0.4
+-- v4.0.5
+--
+-- v4.0.5 修正（真機聽寫實測抓到）：
+--   HK1.[Fix] Right Option 熱鍵完全沒反應 —— hs.hotkey 底層是 Carbon
+--             RegisterEventHotKey，不會對單獨按下的修飾鍵觸發。
+--             改用 hs.eventtap 監聽 flagsChanged
+--   B3.[Fix]  短按產生 0 bytes 錄音 —— ffmpeg 收到 SIGINT 後需要
+--             0.7~0.9 秒收尾，但 0.5s 就送 SIGTERM 打斷它、0.3s 就檢查檔案。
+--             改為等行程真正結束再檢查
 --
 -- v4.0.4 修正（真機驗證抓到的兩個 blocker）：
 --   B1.[Fix] CLI 路徑輸出重複 —— whisper-cli 同時印 stdout 與寫 -otxt，
@@ -56,7 +64,7 @@
 -- ============================================================
 
 -- ── 版本常數 ────────────────────────────────────────────────
-local VERSION = "4.0.4"
+local VERSION = "4.0.5"
 
 -- ── 設定區（Config）──────────────────────────────────────────
 
@@ -74,12 +82,52 @@ local BUILTIN_HALLUCINATION_FILE = PTT_DIR .. "/hallucinations_builtin.txt"
 local HOTKEY_MODS       = {}
 local HOTKEY_KEY        = "rightalt"
 
+-- ── [HK1] 修飾鍵熱鍵 ────────────────────────────────────────
+-- hs.hotkey 底層是 Carbon RegisterEventHotKey，它「不會」對單獨按下的修飾鍵
+-- 觸發——macOS 對修飾鍵送的是 flagsChanged 事件，不是 keyDown/keyUp。
+-- 真機驗證：按住 Right Option 完全沒反應，log 一行都沒有。
+-- 因此修飾鍵必須改用 hs.eventtap 監聽 flagsChanged。
+--
+-- mask 是 IOKit 的「裝置特定」修飾鍵遮罩（NX_DEVICE*KEYMASK），
+-- 用它才能分辨左右；hs.eventtap.event:getFlags() 的 alt/cmd/shift
+-- 不區分左右，左右同時按時會判斷錯誤。
+local MODIFIER_KEYCODES = {
+  rightalt   = { code = 61, mask = 0x40,   flag = "alt"   },
+  leftalt    = { code = 58, mask = 0x20,   flag = "alt"   },
+  rightcmd   = { code = 54, mask = 0x10,   flag = "cmd"   },
+  leftcmd    = { code = 55, mask = 0x08,   flag = "cmd"   },
+  rightshift = { code = 60, mask = 0x04,   flag = "shift" },
+  leftshift  = { code = 56, mask = 0x02,   flag = "shift" },
+  rightctrl  = { code = 62, mask = 0x2000, flag = "ctrl"  },
+  leftctrl   = { code = 59, mask = 0x01,   flag = "ctrl"  },
+}
+
+-- [TESTABLE:maskIsSet] ← tests/test-lua-units.lua 會抽出這段獨立執行
+--- 檢查 CGEventFlags 裡某個單一位元遮罩是否被設起來。
+--- 用除法+取餘而非位元運算子，避免相依於 Lua 版本（5.1 沒有 & 運算子）。
+--- @param flags number|nil  CGEventFlags 整數
+--- @param mask number       單一位元的遮罩（例如右 Option = 0x40）
+--- @return boolean
+local function maskIsSet(flags, mask)
+  if type(flags) ~= "number" or type(mask) ~= "number" or mask <= 0 then
+    return false
+  end
+  return math.floor(flags / mask) % 2 == 1
+end
+-- [/TESTABLE]
+
 -- 時間閾值
 local MIN_RECORD_SEC    = 0.3
 local MIN_FILE_BYTES    = 1000
-local FFMPEG_FLUSH_SEC  = 0.3
+-- [B3] ffmpeg 收到 SIGINT 後仍需時間寫完並收尾 WAV。真機實測需要
+-- 0.7~0.9 秒；這個值只是「行程結束後」再多留一點給檔案系統。
+local FFMPEG_FLUSH_SEC  = 0.15
+-- 等 ffmpeg 行程真正結束的上限
+local RECORD_EXIT_TIMEOUT_SEC = 3.0
 local PASTE_RESTORE_SEC = 0.6
-local KILL_FALLBACK_SEC = 0.5
+-- [B3] SIGINT 之後多久才升級成 SIGTERM。實測 ffmpeg 需要 0.7~0.9 秒收尾，
+-- 原本的 0.5 秒會在它寫完之前就把它砍掉，產生 0 bytes 的錄音檔。
+local KILL_FALLBACK_SEC = 2.0
 
 -- Log
 local MAX_LOG_SIZE      = 512 * 1024
@@ -1368,7 +1416,9 @@ local function stopRecordingAndTranscribe()
   local duration = recordStartAt
                    and (hs.timer.secondsSinceEpoch() - recordStartAt) or 0
   recordStartAt = nil
-  killTask(recordTask)
+  -- [B3] 留住參照，稍後要等這個行程真正結束才檢查錄音檔
+  local finishedRecordTask = recordTask
+  killTask(finishedRecordTask)
   recordTask = nil
   playSound(SOUND_REC_STOP)
 
@@ -1385,7 +1435,10 @@ local function stopRecordingAndTranscribe()
   local langOverride, modelOverride, appName, appPrompt = getLangModelForCurrentApp()
   local promptText = buildPrompt(appPrompt)
 
-  hs.timer.doAfter(FFMPEG_FLUSH_SEC, function()
+  -- [B3] 等 ffmpeg 真正結束再檢查檔案，而不是固定延遲後就假設它寫完了。
+  -- 原本固定等 FFMPEG_FLUSH_SEC(0.3s) 就檢查，但 ffmpeg 需要 0.7~0.9 秒收尾，
+  -- 短錄音時檔案還是 0 bytes —— 真機三輪測試三次命中。
+  local function afterRecordingSettled()
     if sid ~= sessionCounter then return end
     if currentState ~= STATE.TRANSCRIBING then return end
 
@@ -1485,7 +1538,18 @@ local function stopRecordingAndTranscribe()
       transcribeTask = nil
       abortToIdle("Script Failed", { alert = "❌ transcribe.sh 啟動失敗" })
     end
-  end)
+  end
+
+  waitForTaskExit(finishedRecordTask,
+    hs.timer.secondsSinceEpoch() + RECORD_EXIT_TIMEOUT_SEC,
+    function(exited)
+      if not exited then
+        appendErrorLog(string.format(
+          "ffmpeg 未在 %.1fs 內結束，仍嘗試讀取錄音檔", RECORD_EXIT_TIMEOUT_SEC))
+      end
+      -- 行程已結束，再留一點時間給檔案系統把資料落地
+      hs.timer.doAfter(FFMPEG_FLUSH_SEC, afterRecordingSettled)
+    end)
 end
 
 -- ── [F7][CR1] 健康檢查 / 自我診斷 ──────────────────────────
@@ -1795,6 +1859,12 @@ end
 
 PTTWhisper.runDiagnostics = runDiagnostics
 
+-- ── [HK1] 熱鍵狀態（必須宣告在 cleanup 之前）──────────────
+local modifierTap      = nil
+local hotkeyObj        = nil
+local modifierIsHeld   = false
+local HOTKEY_MECHANISM = "(未綁定)"
+
 -- ── Cleanup ─────────────────────────────────────────────────
 local function cleanup()
   if recordTask then pcall(function() recordTask:terminate() end) end
@@ -1805,6 +1875,10 @@ local function cleanup()
   currentState   = STATE.IDLE
   recordStartAt  = nil
   os.remove(RECORD_FILE)
+  -- [HK1] 收掉修飾鍵 eventtap，否則 reload 會累積多個 tap
+  if modifierTap then pcall(function() modifierTap:stop() end); modifierTap = nil end
+  if hotkeyObj then pcall(function() hotkeyObj:delete() end); hotkeyObj = nil end
+  modifierIsHeld = false
   -- [SV1] 一定要收掉常駐 server，否則 reload 後埠會被殘留行程占住
   stopServer()
   if menubarItem then menubarItem:delete(); menubarItem = nil end
@@ -1925,7 +1999,45 @@ if menubarItem then
 end
 
 -- ── 熱鍵綁定 ────────────────────────────────────────────────
-hs.hotkey.bind(HOTKEY_MODS, HOTKEY_KEY, onKeyDown, onKeyUp)
+--- 判斷這個 flagsChanged 事件代表目標修飾鍵「按下」還是「放開」
+local function modifierIsDown(e, spec)
+  local ok, raw = pcall(function() return e:getRawEventData() end)
+  local flags = ok and raw and raw.CGEventData and raw.CGEventData.flags or nil
+  if type(flags) == "number" then
+    return maskIsSet(flags, spec.mask)
+  end
+  -- fallback：只看粗粒度 flag。左右同型修飾鍵同時按住時會失準，
+  -- 但不會造成誤觸發，只會延後放開的判定。
+  local f = e:getFlags() or {}
+  return f[spec.flag] == true
+end
+
+local spec = MODIFIER_KEYCODES[HOTKEY_KEY]
+if spec and #HOTKEY_MODS == 0 then
+  modifierTap = hs.eventtap.new({ hs.eventtap.event.types.flagsChanged }, function(e)
+    if e:getKeyCode() ~= spec.code then return false end
+    local down = modifierIsDown(e, spec)
+    if down and not modifierIsHeld then
+      modifierIsHeld = true
+      onKeyDown()
+    elseif (not down) and modifierIsHeld then
+      modifierIsHeld = false
+      onKeyUp()
+    end
+    return false  -- 不吞掉事件，其他 App 照常收到這個修飾鍵
+  end)
+  modifierTap:start()
+  HOTKEY_MECHANISM = "eventtap(flagsChanged)"
+else
+  -- 非修飾鍵仍走 hs.hotkey（它對一般按鍵是正確且更省資源的做法）
+  hotkeyObj = hs.hotkey.bind(HOTKEY_MODS, HOTKEY_KEY, onKeyDown, onKeyUp)
+  HOTKEY_MECHANISM = "hs.hotkey"
+end
+
+PTTWhisper.hotkeyMechanism = function()
+  return HOTKEY_MECHANISM,
+         (modifierTap ~= nil) and modifierTap:isEnabled() or (hotkeyObj ~= nil)
+end
 
 -- ── [SV1] 啟動常駐 server（server_mode = false 時直接 return）──
 -- 非同步：模型載入期間不阻塞 Hammerspoon 載入，
