@@ -44,9 +44,16 @@
 - Hammerspoon 載入、熱鍵綁定、錄音、剪貼簿貼上、Secure Input 偵測
 - `hs.task` 的 server 生命週期：啟動、`/health` 輪詢、terminate、重啟
 - generation guard 在真實非同步時序下的行為
-- 與**真正的** `whisper-server` 的 HTTP 契約
-  （`/health` 回應格式、`/inference` 是否真的吃 `max_context`、`no_timestamps`）
+- **你這台編譯出來的** `whisper-server` 是否與 upstream contract 一致
+  （`/health` 回應格式、`/inference` 對 `max_context` / `no_timestamps` 的處理）
+- production 用的 `hs.json.decode`（測試注入的是 test double）
 - 真實模型的轉錄品質、`-mc 0` 與預設 context 的 A/B 比較
 
-若本機沒有 lua 直譯器，`80-health-scenarios.sh` 的 Lua 分類器單元測試會被
-**略過**並明確標示。安裝任一 lua（`brew install lua`）後會自動執行。
+`80-health-scenarios.sh` 會用 lua 直譯器實際執行 `classifyHealthResponse`
+（從 `ptt_whisper.lua` 的 `[TESTABLE:...]` 區塊抽出來，不是複製一份實作）。
+本機沒有 lua 時會**略過**並明確標示——`brew install lua` 後自動執行。
+
+該測試注入的是一份嚴格的 JSON decoder test double，因為 `hs.json.decode`
+只存在於 Hammerspoon runtime。被測的仍是同一份出貨程式碼，但
+**`hs.json.decode` 這個替換本身沒有自動化覆蓋**，列在
+`REAL_MAC_VALIDATION.md` 第 13 項。

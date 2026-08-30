@@ -16,13 +16,26 @@ REQLOG = os.environ.get('FAKE_REQLOG', '')
 TEXT   = os.environ.get('FAKE_SERVER_TEXT', 'server transcription result')
 
 HEALTH_RESPONSES = {
-    # mode        -> (status, body)
-    'ok':        (200, b'{"status":"ok"}'),
-    'loading':   (503, b'{"status":"loading model"}'),
-    'notfound':  (404, b'Not Found'),
-    'foreign':   (200, b'<html><body>Welcome to nginx!</body></html>'),
-    'malformed': (200, b'{"unexpected":"shape"}'),
-    'error':     (500, b'internal error'),
+    # mode              -> (status, body)
+    # whisper.cpp server 的正式契約
+    'ok':                (200, b'{"status":"ok"}'),
+    'loading':           (503, b'{"status":"loading model"}'),
+    # 曾經會被 substring 判斷誤判成 ready 的情境
+    'status_message':    (200, b'{"status_message":"ok"}'),
+    'notok':             (200, b'{"status":"not ok"}'),
+    'plaintext_ok':      (200, b'status check ok'),
+    # 503 但不是 loading
+    'loading_error':     (503, b'{"status":"error"}'),
+    'malformed503':      (503, b'{status: broken'),
+    # 其他外部服務 / 錯誤
+    'notfound':          (404, b'Not Found'),
+    'foreign':           (200, b'<html><body>Welcome to nginx!</body></html>'),
+    'malformed':         (200, b'{"unexpected":"shape"}'),
+    'error':             (500, b'internal error'),
+    'ok_extra':          (200, b'{"status":"ok","model":"ggml-small-q5_1.bin"}'),
+    'status_bool':       (200, b'{"status":true}'),
+    'json_array':        (200, b'[1,2,3]'),
+    'empty':             (200, b''),
 }
 
 

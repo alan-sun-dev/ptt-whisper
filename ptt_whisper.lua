@@ -1,6 +1,11 @@
 -- ============================================================
 -- Push-to-Talk Whisper Dictation for Hammerspoon
--- v4.0.1
+-- v4.0.2
+--
+-- v4.0.2 強化：
+--   S1.[Fix]  /health 分類改用 JSON 解析，不再 substring 推斷
+--             （{"status_message":"ok"} 之類會被誤判成 ready）
+--   S2.[Fix]  occupancy 偵測不再重用 readiness 分類器，避免連帶收緊
 --
 -- v4.0.1 強化：
 --   H1.[Fix]  readiness 改用 GET /health（行程活著 ≠ 模型可用）
@@ -43,7 +48,7 @@
 -- ============================================================
 
 -- ── 版本常數 ────────────────────────────────────────────────
-local VERSION = "4.0.1"
+local VERSION = "4.0.2"
 
 -- ── 設定區（Config）──────────────────────────────────────────
 
@@ -757,35 +762,73 @@ local function findWhisperServerBin()
 end
 
 -- [TESTABLE:classifyHealthResponse] ← tests/test-lua-units.lua 會抽出這段獨立執行
---- 把 GET /health 的結果分類。純函式，不碰任何全域狀態，方便單獨測試。
+--- 把 GET /health 的結果分類。純函式，不碰任何全域狀態。
+---
+--- whisper.cpp server 的正式契約：
+---   ready   HTTP 200  {"status":"ok"}
+---   loading HTTP 503  {"status":"loading model"}
 ---
 --- 決策表：
----   連線失敗 (status nil 或 < 100)      → "unavailable"  沒有東西在這個 port
----   200 + body 含 status 且含 ok        → "ready"        whisper-server 模型已就緒
----   200 + 其他 body                     → "foreign"      有 HTTP 服務，但不是就緒的 whisper-server
----   503                                 → "loading"      whisper-server 在載入模型（行程活著但還不能用）
----   其他 HTTP status（403/404/500…）    → "foreign"      有東西在聽，但不是有效的 whisper-server
+---   連線失敗（status nil 或 < 100）                    → "unavailable"
+---   200 + 合法 JSON object + status == "ok"            → "ready"
+---   503 + 合法 JSON object + status == "loading model" → "loading"
+---   其他一切（含 200 非 JSON、200 無關 JSON、
+---            503 無關 JSON、404、500…）                → "foreign"
+---
+--- 刻意不做 substring 判斷：像 {"status_message":"not ok"} 或純文字
+--- "status check ok" 都同時含有 status 與 ok，會造成 false-positive ready。
 ---
 --- 關鍵區分：
----   "行程活著"（loading / foreign）  ≠  "模型可用"（ready）
----   "port 空著"（unavailable）       ≠  "port 被別的服務占用"（foreign）
+---   「行程活著」（loading / foreign）  ≠  「模型可用」（ready）
+---   「port 空著」（unavailable）      ≠  「port 被別的服務占用」（foreign）
+---
+--- @param status number|nil  HTTP status；nil 或 < 100 代表連線失敗
+--- @param body string|nil    回應內容
+--- @param decode function|nil JSON decoder，預設 hs.json.decode。
+---        參數化的唯一目的：讓 tests/test-lua-units.lua 能在沒有 Hammerspoon
+---        的環境下直接執行「這一份」程式碼，而不是複製一份實作去測。
 --- @return string state, string detail
-local function classifyHealthResponse(status, body)
+local function classifyHealthResponse(status, body, decode)
   if status == nil or status < 100 then
     return "unavailable", "connection failed"
   end
-  body = body or ""
-  if status == 200 then
-    local lowered = body:lower()
-    if lowered:find("status", 1, true) and lowered:find("ok", 1, true) then
-      return "ready", body:sub(1, 120)
-    end
-    return "foreign", "HTTP 200 但 /health 回應不像 whisper-server: " .. body:sub(1, 120)
+
+  local detail = (body or ""):sub(1, 120)
+
+  -- 只有 200 與 503 在契約內，其餘一律 foreign（有東西在聽，但不是 whisper-server）
+  if status ~= 200 and status ~= 503 then
+    return "foreign", "HTTP " .. tostring(status)
   end
-  if status == 503 then
-    return "loading", body:sub(1, 120)
+
+  decode = decode or (rawget(_G, "hs") and hs.json and hs.json.decode)
+  if not decode then
+    return "foreign", "no JSON decoder available"
   end
-  return "foreign", "HTTP " .. tostring(status)
+
+  -- hs.json.decode 遇到非法 JSON 會 raise error（不是回傳 nil），必須包 pcall
+  local parsed
+  local ok
+  ok, parsed = pcall(decode, body or "")
+  if not ok or type(parsed) ~= "table" then
+    return "foreign",
+      "HTTP " .. tostring(status) .. " body 不是合法 JSON object: " .. detail
+  end
+
+  -- 陣列在 Lua 裡也是 table，所以「是 table」不夠；status 必須是字串
+  local st = parsed.status
+  if type(st) ~= "string" then
+    return "foreign",
+      "HTTP " .. tostring(status) .. " JSON 沒有 status 字串: " .. detail
+  end
+
+  if status == 200 and st == "ok" then
+    return "ready", detail
+  end
+  if status == 503 and st == "loading model" then
+    return "loading", detail
+  end
+  return "foreign",
+    "HTTP " .. tostring(status) .. " status=\"" .. st .. "\""
 end
 -- [/TESTABLE]
 
@@ -803,12 +846,13 @@ end
 --- @param callback function(occupied: boolean, detail: string)
 local function probeEndpointOccupancy(callback)
   hs.http.asyncGet(serverBaseURL() .. "/health", nil, function(status)
-    local state = classifyHealthResponse(status, nil)
-    if state == "unavailable" then
-      callback(false, "no listener")
-    else
-      callback(true, state .. " (HTTP " .. tostring(status) .. ")")
-    end
+    -- 任何 HTTP 回應（含 404 / 500 / 非 JSON）都代表 port 上有人在聽。
+    -- 這裡刻意「不」重用 classifyHealthResponse：readiness 收緊成
+    -- 「必須是 whisper-server 的 JSON 契約」之後，若 occupancy 跟著收緊，
+    -- 回 404 的其他 HTTP 服務就會被誤判成「port 是空的」，
+    -- 接著我們啟動 whisper-server 並 bind 失敗。兩者語意必須各自獨立。
+    local occupied = (status ~= nil and status >= 100)
+    callback(occupied, occupied and ("HTTP " .. tostring(status)) or "no listener")
   end)
 end
 

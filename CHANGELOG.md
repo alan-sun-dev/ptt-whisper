@@ -5,6 +5,66 @@
 
 ---
 
+## [4.0.2] / transcribe.sh 2.10.1 — 嚴格 /health 分類
+
+### Fixed
+
+- **`classifyHealthResponse` 改用 JSON 解析，不再做 substring 推斷。**
+
+  原本 HTTP 200 的判定是「body 小寫後同時含 `status` 與 `ok`」。
+  這會把下列全部誤判成 ready：
+
+  ```
+  {"status_message":"ok"}      ← status 與 ok 都在，但不是 whisper 的契約
+  {"status":"not ok"}          ← 明確表示不 ok
+  status check ok              ← 根本不是 JSON
+  ```
+
+  改為對照 whisper.cpp server 的正式契約：
+
+  | 回應 | 分類 |
+  |---|---|
+  | 連線失敗 | `unavailable` |
+  | `200` + 合法 JSON object + `status == "ok"` | `ready` |
+  | `503` + 合法 JSON object + `status == "loading model"` | `loading` |
+  | 其他一切（200 非 JSON、200 無關 JSON、503 無關 JSON、404、500…） | `foreign` |
+
+  實作細節：`hs.json.decode` 遇到非法 JSON 會 **raise error 而非回傳 nil**，
+  因此包在 `pcall` 裡；JSON 陣列在 Lua 裡也是 table，所以除了「是 table」
+  還要求 `status` 必須是**字串**。
+
+- **`probeEndpointOccupancy()` 不再重用 `classifyHealthResponse`。**
+  readiness 收緊成「必須符合 whisper 的 JSON 契約」之後，若 occupancy 跟著
+  收緊，回 404 的其他 HTTP 服務會被誤判成「port 是空的」，接著 bind 失敗。
+  占用偵測維持「任何 HTTP 回應都算被占用」。
+
+- **測試抽取 pattern 的 bug。** `[TESTABLE:...]` 的擷取從 `]` 之後開始，
+  把 marker 行尾那段沒有 `--` 前綴的中文說明也當成程式碼。
+  這個 bug 一直存在，但因為本機沒有 lua 直譯器、測試從未真正執行過，
+  所以從未暴露。改為從 marker 行的**換行之後**開始擷取。
+
+### Testing
+
+`./tests/run.sh` → **180 passed, 0 failed, 0 skipped**（前一版是 128 + 1 skipped）。
+
+`classifyHealthResponse` 現在由 lua 直譯器**實際執行** 43 條斷言：
+27 條決策表 + 16 條「拿 fake server 真實回應餵進去」的情境，涵蓋
+`{"status_message":"ok"}`、`{"status":"not ok"}`、`status check ok`、
+`{"status":true}`、JSON 陣列、空 body、malformed JSON、503 非 loading 等
+全部誤判向量。
+
+被測的是從 `ptt_whisper.lua` 抽出的同一份程式碼，不是複製的實作。
+測試注入嚴格 JSON decoder test double，因為 `hs.json.decode` 只存在於
+Hammerspoon runtime——**這個替換本身沒有自動化覆蓋**，已列入真機驗證。
+
+### Docs
+
+- `REAL_MAC_VALIDATION.md` 措辭修正：第 22/23 項的目的不是再證明 upstream
+  支不支援（原始碼已確認支援），而是確認**這台實際編譯出來的 build**
+  與 contract 是否一致。
+
+---
+
 ## [4.0.1] / transcribe.sh 2.10.1 — Hardening
 
 沒有新功能。這一版把 v3.8.0 引進的 server 路徑修到可以信任的程度，

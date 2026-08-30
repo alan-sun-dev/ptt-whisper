@@ -24,13 +24,26 @@ probe() { # probe <scenario> <expected_status>
   t_server_stop
 }
 
-probe loading   503
-probe ok        200
-probe notfound  404
-probe foreign   200
-probe malformed 200
-probe error     500
-probe refused   000
+# whisper.cpp server 的正式契約
+probe ok             200
+probe loading        503
+probe ok_extra       200
+# 曾經會被 substring 判斷誤判成 ready 的情境
+probe status_message 200
+probe notok          200
+probe plaintext_ok   200
+probe status_bool    200
+probe json_array     200
+probe empty          200
+# 503 但不是 loading
+probe loading_error  503
+probe malformed503   503
+# 其他服務 / 錯誤
+probe notfound       404
+probe foreign        200
+probe malformed      200
+probe error          500
+probe refused        000
 
 echo "    ── Lua classifyHealthResponse 分類驗證 ──"
 LUA_BIN=""
