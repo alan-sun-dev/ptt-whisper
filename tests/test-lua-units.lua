@@ -265,5 +265,41 @@ check("中間失敗後，第三筆維持 add=true（不重新清空）", addLog[
 
 check("空清單 → wrote = 0", restoreEntries({}, function() return true end), 0)
 
+-- ── [DX2] tailLines：ffmpeg 診斷輸出的截取 ────────────────
+local tailChunk = extract(readAll(srcPath), "tailLines") .. "\nreturn tailLines\n"
+local tailLines = assert(loader(tailChunk, "tailLines"))()
+
+check("nil → 明確標示無輸出",     tailLines(nil, 5), "(無輸出)")
+check("空字串 → 明確標示無輸出",   tailLines("", 5),  "(無輸出)")
+check("只有空白與換行 → 無輸出",   tailLines("\n  \n\n", 5), "(無輸出)")
+check("非字串 → 無輸出",          tailLines(123, 5), "(無輸出)")
+
+check("單行加縮排",               tailLines("only line", 5), "    only line")
+check("行數少於 n 時全部保留",
+      tailLines("a\nb", 5), "    a\n    b")
+check("取最後 n 行（丟掉開頭的橫幅）",
+      tailLines("banner1\nbanner2\nerr1\nerr2", 2), "    err1\n    err2")
+check("每行都會被 trim",
+      tailLines("   x   \n   y   ", 2), "    x\n    y")
+check("空行不計入行數",
+      tailLines("a\n\n\nb\n\nc", 2), "    b\n    c")
+check("n 非數字 → 退回預設 10 行",
+      tailLines("a\nb\nc", nil), "    a\n    b\n    c")
+
+-- ffmpeg 真實輸出的形態：開頭大量橫幅、結尾才是錯誤
+local FFMPEG_LIKE = table.concat({
+  "ffmpeg version 8.1 Copyright (c) 2000-2026",
+  "  built with Apple clang version 17.0.0",
+  "  configuration: --prefix=/opt/homebrew",
+  "[AVFoundation indev @ 0x600] Selected audio device",
+  "[in#0 @ 0x600] Error opening input: Device or resource busy",
+  "Error opening input file :0.",
+}, "\n")
+local tail = tailLines(FFMPEG_LIKE, 2)
+check("ffmpeg 形態：保留結尾的錯誤",
+      tail:find("Device or resource busy", 1, true) ~= nil, true)
+check("ffmpeg 形態：丟掉開頭的版本橫幅",
+      tail:find("ffmpeg version", 1, true) == nil, true)
+
 print(string.format("-- lua units: %d passed, %d failed", pass, fail))
 os.exit(fail == 0 and 0 or 1)

@@ -5,6 +5,65 @@
 
 ---
 
+## [4.0.8] — 錄音診斷
+
+`transcribe.sh` 未變動，維持 2.10.2。純診斷改動，不改變任何控制流程。
+
+### Diagnostics — ffmpeg 的 stderr 不再被丟棄
+
+「錄音檔 0 bytes」在真機上復現四次以上，每次都查不出原因。癥結是**能解釋
+原因的訊息從來沒有被記錄**：
+
+```lua
+recordTask = hs.task.new(ffmpeg, function(exitCode, _, stderr)
+  if exitCode ~= 0 and exitCode ~= 255 and currentState == STATE.RECORDING then
+    ... appendErrorLog("... stderr=" .. stderr)   -- 只有這裡會寫 stderr
+```
+
+但失敗案例中 ffmpeg 會拖到我們早已進入 `TRANSCRIBING` 之後才結束，
+`currentState == STATE.RECORDING` 不成立，stderr 被靜靜丟棄。
+
+現在每次錄音結束都記錄一行：
+
+```
+recording: ffmpeg exit=255 size=48272 bytes state=transcribing
+```
+
+並且在 exit code 非預期（不是 0/255）**或**檔案小於 `MIN_FILE_BYTES` 時，
+additionally 附上 stderr 的尾端 12 行：
+
+```
+recording: ffmpeg stderr（尾端 12 行）
+    [AVFoundation indev @ 0x600] Selected audio device
+    [in#0 @ 0x600] Error opening input: Device or resource busy
+```
+
+只在出問題時附 stderr——ffmpeg 每次都會印一大段版本橫幅，無條件記錄會讓
+log 迅速膨脹。取尾端而非開頭，因為橫幅在前、錯誤在後。
+
+截取邏輯抽成純函式 `tailLines`，12 條單元測試（nil / 空字串 / 只有空白 /
+非字串 / 行數不足 / trim / 空行不計入 / n 非數字 / ffmpeg 形態的輸出）。
+
+### Fixed — 測試套件會在直譯器中途崩潰時誤報 PASS
+
+寫上面那 12 條測試時撞到的：`tailLines` 初版在 `for` 迴圈裡重新指派迴圈
+變數，Lua 5.5 起這是 const，直接報錯（Hammerspoon 用 5.4 可以，
+但沒有理由寫成只在特定版本能跑）。
+
+真正的問題是**測試套件沒有抓到**：lua 產出了 51 條 PASS 之後才崩潰，
+而崩潰偵測只檢查「有沒有產出斷言」（`n_assert -eq 0`），51 > 0 所以
+沒觸發，套件回報 `215 passed / RESULT: PASS`——但 12 條新斷言一條都沒跑。
+
+現在額外檢查 exit code：產出了斷言但 exit 非 0 且沒有任何 `FAIL` 行，
+即判定為「中途崩潰，其餘斷言未執行」。已雙向驗證（故意重現該 bug 時
+會報 `在第 67 條之後崩潰（exit=1）`）。
+
+### Testing
+
+`./tests/run.sh` → **227 passed, 0 failed, 0 skipped**（前一版 215）。
+
+---
+
 ## [4.0.7] — 剪貼簿寫入失敗的判定
 
 `transcribe.sh` 未變動，維持 2.10.2。

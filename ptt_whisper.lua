@@ -1,6 +1,12 @@
 -- ============================================================
 -- Push-to-Talk Whisper Dictation for Hammerspoon
--- v4.0.7
+-- v4.0.8
+--
+-- v4.0.8 診斷：
+--   DX2.[Diag] 錄音結束時無論處於哪個狀態都記錄 ffmpeg 的 exit code、
+--              檔案大小與（出問題時的）stderr。原本 stderr 只在
+--              currentState == STATE.RECORDING 時才記錄，而 0 bytes 的
+--              失敗案例中 ffmpeg 早已拖過那個狀態，證據被靜靜丟棄
 --
 -- v4.0.7 修正：
 --   CB2.[Fix] restoreClipboard 只檢查 pcall 的第一個回傳值，忽略了
@@ -76,7 +82,7 @@
 -- ============================================================
 
 -- ── 版本常數 ────────────────────────────────────────────────
-local VERSION = "4.0.7"
+local VERSION = "4.0.8"
 
 -- ── 設定區（Config）──────────────────────────────────────────
 
@@ -680,6 +686,30 @@ local function resolveModelPath(modelName)
   if hs.fs.attributes(path) then return path end
   return nil
 end
+
+-- [TESTABLE:tailLines] ← tests/test-lua-units.lua 會抽出這段獨立執行
+--- 取出文字最後 n 個非空行，每行前面加縮排。
+--- ffmpeg 的橫幅在開頭、真正的錯誤在結尾，所以診斷要看尾巴；
+--- 同時避免把整份輸出（可能上百行）塞進 log。
+--- @param text string|nil
+--- @param n number  要保留的行數
+--- @return string
+local function tailLines(text, n)
+  if type(text) ~= "string" or text == "" then return "(無輸出)" end
+  local lines = {}
+  -- 不要重新指派 for 的迴圈變數：Lua 5.5 起它是 const，會直接報錯。
+  -- Hammerspoon 目前用 5.4 可以這樣寫，但沒有理由寫成只在特定版本能跑。
+  for raw in text:gmatch("[^\n]+") do
+    local line = raw:match("^%s*(.-)%s*$")
+    if line ~= "" then lines[#lines + 1] = line end
+  end
+  if #lines == 0 then return "(無輸出)" end
+  local from = math.max(1, #lines - (tonumber(n) or 10) + 1)
+  local out = {}
+  for i = from, #lines do out[#out + 1] = "    " .. lines[i] end
+  return table.concat(out, "\n")
+end
+-- [/TESTABLE]
 
 --- [CR1] 列出音訊裝置（改用 runCommandSync，不再拼 shell 字串）
 local function listAudioDevices()
@@ -1441,6 +1471,28 @@ local function startRecording()
 
   recordTask = hs.task.new(ffmpeg, function(exitCode, _, stderr)
     cancelKillFallbackTimer()
+
+    -- [DX2] 錄音診斷：無論 ffmpeg 結束時處於哪個狀態都記錄結果。
+    --
+    -- 原本 stderr 只在下方 currentState == STATE.RECORDING 的分支裡才會被寫進
+    -- log。但「錄音檔 0 bytes」的失敗案例中，ffmpeg 會拖到我們早已進入
+    -- TRANSCRIBING／IDLE 之後才結束，條件不成立，於是唯一能解釋原因的訊息
+    -- 被靜靜丟棄。真機上這個問題復現四次以上都查不出原因，就是因為這個。
+    --
+    -- 這裡只增加記錄，不改變任何控制流程。
+    local recAttr = hs.fs.attributes(RECORD_FILE)
+    local recSize = (recAttr and recAttr.size) or 0
+    local expectedExit = (exitCode == 0 or exitCode == 255)
+    appendErrorLog(string.format(
+      "recording: ffmpeg exit=%s size=%d bytes state=%s",
+      tostring(exitCode), recSize, tostring(currentState)))
+    -- 只有出問題時才附上 stderr——ffmpeg 每次都會印一大段橫幅，
+    -- 無條件記錄會讓 log 迅速膨脹。
+    if (not expectedExit) or recSize < MIN_FILE_BYTES then
+      appendErrorLog("recording: ffmpeg stderr（尾端 12 行）\n"
+                     .. tailLines(stderr, 12))
+    end
+
     -- [CR11] FFmpeg 收到 SIGINT（正常終止錄音）時在 macOS 回傳 255，
     -- 這是預期行為而非錯誤，因此 255 與 0 一樣不觸發錯誤處理。
     if exitCode ~= 0 and exitCode ~= 255 and currentState == STATE.RECORDING then
