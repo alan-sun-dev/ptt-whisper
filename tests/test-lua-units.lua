@@ -203,5 +203,67 @@ check("含粗粒度 alt 位元但實際是左 Option",
 check("flags 為 nil → false（不誤觸發）",  maskIsSet(nil, RALT), false)
 check("mask 為 0 → false",                 maskIsSet(RALT, 0), false)
 
+-- ── [CB2] restoreClipboardEntries：pcall 與回傳值兩層都要檢查 ──────
+-- writeDataForUTI 在真實 runtime 幾乎不回 false（實測空 UTI、非法 UTI、
+-- 不存在的 pasteboard 名稱全都回 true），所以失敗路徑只能靠注入 writer
+-- 來驗證。這裡執行的是從 ptt_whisper.lua 抽出的同一份出貨程式碼。
+local restoreChunk = extract(readAll(srcPath), "restoreClipboardEntries")
+  .. "\nreturn restoreClipboardEntries\n"
+local restoreEntries = assert(loader(restoreChunk, "restoreClipboardEntries"))()
+
+local ENTRIES = {
+  { uti = "public.utf8-plain-text", data = "A" },
+  { uti = "public.rtf",             data = "B" },
+  { uti = "public.html",            data = "C" },
+}
+
+-- case A：pcall 成功 + 回 true → 計入
+local addLog = {}
+local n = restoreEntries(ENTRIES, function(_, _, add)
+  addLog[#addLog + 1] = add; return true
+end)
+check("A. 全部成功 → wrote = 3", n, 3)
+check("A. 第一筆 add=false", addLog[1], false)
+check("A. 第二筆 add=true",  addLog[2], true)
+check("A. 第三筆 add=true",  addLog[3], true)
+
+-- case B：pcall 成功但回 false → 不可計入
+n = restoreEntries(ENTRIES, function() return false end)
+check("B. 回 false → wrote = 0（不可誤算成功）", n, 0)
+
+-- case C：writer 拋出錯誤 → 不可計入
+n = restoreEntries(ENTRIES, function() error("boom") end)
+check("C. writer throw → wrote = 0", n, 0)
+
+-- case D：全部失敗 → wrote = 0，純文字 fallback 才有機會被觸發
+n = restoreEntries(ENTRIES, function() return nil end)
+check("D. 回 nil → wrote = 0（fallback 可達）", n, 0)
+
+-- 關鍵：第一筆失敗時，第二筆仍必須以 add=false 開始。
+-- 否則會疊加到剪貼簿上殘留的轉錄文字，而不是取代它。
+addLog = {}
+local callCount = 0
+n = restoreEntries(ENTRIES, function(_, _, add)
+  callCount = callCount + 1
+  addLog[#addLog + 1] = add
+  return callCount > 1          -- 第一筆失敗，其餘成功
+end)
+check("第一筆失敗 → wrote = 2", n, 2)
+check("第一筆 add=false", addLog[1], false)
+check("第一筆失敗後，第二筆仍是 add=false（不可疊加）", addLog[2], false)
+check("第三筆才變 add=true", addLog[3], true)
+
+-- 中間失敗不應該讓已成功的部分被重新清空
+addLog = {}; callCount = 0
+n = restoreEntries(ENTRIES, function(_, _, add)
+  callCount = callCount + 1
+  addLog[#addLog + 1] = add
+  return callCount ~= 2         -- 第二筆失敗
+end)
+check("中間失敗 → wrote = 2", n, 2)
+check("中間失敗後，第三筆維持 add=true（不重新清空）", addLog[3], true)
+
+check("空清單 → wrote = 0", restoreEntries({}, function() return true end), 0)
+
 print(string.format("-- lua units: %d passed, %d failed", pass, fail))
 os.exit(fail == 0 and 0 or 1)

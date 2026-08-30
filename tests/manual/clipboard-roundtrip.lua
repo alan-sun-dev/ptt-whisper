@@ -9,6 +9,17 @@
 -- 背景：writeDataForUTI 的第 4 個參數 add 預設為 false，每次呼叫都會先清空
 -- 剪貼簿。不帶這個參數的迴圈跑完只剩最後一個 UTI，從文件複製的多型別內容
 -- 會整個消失。單一型別（純文字）不會出事，所以很容易漏掉。
+--
+-- 涵蓋範圍分工（不要誤以為這支腳本涵蓋全部）：
+--
+--   這支手動腳本      真實 hs.pasteboard 的多型別往返（成功路徑）
+--   ./tests/run.sh    寫入失敗的語意（pcall 成功但回 false／writer throw／
+--                     全部失敗時 fallback 可達／第一筆失敗後 add 仍為 false）
+--                     —— 見 tests/test-lua-units.lua 的 restoreClipboardEntries
+--
+-- 失敗路徑之所以只能靠注入 writer 測：實測 writeDataForUTI 在這個
+-- Hammerspoon 版本用空 UTI、非法 UTI、不存在的 pasteboard 名稱都回 true，
+-- 無法在真實 runtime 逼出 false。
 hs.timer.doAfter(2, function()
   local out = {}
   local function log(s) out[#out + 1] = s end

@@ -1,20 +1,29 @@
 # 真機驗證清單（v4.0.x）
 
-開發環境**沒有** Hammerspoon runtime，也**沒有** whisper.cpp runtime。
+**狀態：A / B / C 三段已於 2026-08-30 在真實 Mac 上完成驗證。**
 
-`./tests/run.sh` 驗證的是 `transcribe.sh` 的行為，以及 Lua 的**純函式**
-（`classifyHealthResponse` 由 lua 直譯器實際執行，43 條斷言）。
-它使用 fake whisper-cli 與 fake whisper-server，**不是** runtime 驗證。
+歷史脈絡：這份清單最初寫成時，開發環境沒有 Hammerspoon runtime 也沒有
+whisper.cpp runtime，因此所有 Hammerspoon 相關行為都只能靠靜態檢查。
+後來在同一台 Mac 上做了 fresh install（Hammerspoon 1.1.1 + 自行編譯的
+whisper.cpp），把 A/B/C 全部跑完——過程中抓到五個自動化測試完全測不到的
+問題（見 CHANGELOG v4.0.4 ~ v4.0.7）。
 
-整份 `ptt_whisper.lua` 只做過區塊平衡與定義順序的靜態檢查——那不等於
-「能在 Hammerspoon 裡載入」，更不等於「非同步行為正確」。
+`./tests/run.sh` 驗證的是 `transcribe.sh` 的行為，以及從 `ptt_whisper.lua`
+抽出的純函式（`classifyHealthResponse`、`maskIsSet`、
+`restoreClipboardEntries`，由 lua 直譯器實際執行）。它使用 fake whisper-cli
+與 fake whisper-server，**不是** runtime 驗證——整份 `ptt_whisper.lua` 的
+載入與非同步行為仍然只有真機能證明。
 
-另外，`classifyHealthResponse` 在測試中注入的是一份嚴格的 JSON decoder
-test double；production 走的是 `hs.json.decode`。**這個替換本身沒有被
-自動化驗證過**，所以第 13 項同時也是在驗證 `hs.json.decode` 的行為
-（尤其是它對非法 JSON 會 raise error、被 `pcall` 接住這件事）。
+測試中有兩處注入了 test double，production 走的是真正的 Hammerspoon API：
 
-以下必須在真實 Mac 上人工完成。合併 PR 前請逐項確認。
+| 純函式 | 測試注入 | production |
+|---|---|---|
+| `classifyHealthResponse` | 自寫的嚴格 JSON parser | `hs.json.decode` |
+| `restoreClipboardEntries` | 假的 writer（可回 false／throw） | `hs.pasteboard.writeDataForUTI` |
+
+第二項的失敗路徑**只能**靠注入驗證：實測 `writeDataForUTI` 在這個
+Hammerspoon 版本用空 UTI、非法 UTI、不存在的 pasteboard 名稱都回 `true`，
+無法在真實 runtime 逼出 `false`。
 
 ## ✅ A / B / C 已於 2026-08-30 在真機完成驗證
 
@@ -58,9 +67,16 @@ test double；production 走的是 `hs.json.decode`。**這個替換本身沒有
 
 ### 已釐清的 upstream 契約
 
-- [x] 22. `/health` ready 實測：`HTTP/1.1 200 OK` ·
-       `Content-Type: application/json` · `{"status":"ok"}`
-       **與 contract 相符**
+- [x] 22. `/health` **ready** 契約實測：`HTTP/1.1 200 OK` ·
+       `Content-Type: application/json` · `{"status":"ok"}` — 與 contract 相符。
+
+       **`503 loading` 不需要、也無法在初次啟動時驗證。** 原始碼證實
+       whisper.cpp 的 server 先 `whisper_init_from_file`（`server.cpp:726`）、
+       再 `state.store(READY)`（735），HTTP listen 更晚，所以啟動期間
+       `/health` 只會是 connection-refused。實測用 1.5GB 模型也抓不到 503。
+       `loading` 分支是為 runtime 呼叫 `/load` 換模型的路徑而存在的
+       defensive code，其分類邏輯已由自動化測試覆蓋。
+
 - [x] 23. `/inference` 實測接受 `response_format` / `no_timestamps` /
        `prompt` / `max_context`（`max_context=abc` → HTTP 500，
        但 `transcribe.sh` 已先驗證不會送出）
@@ -78,11 +94,14 @@ test double；production 走的是 `hs.json.decode`。**這個替換本身沒有
 
 ## E. 待你決定的實驗（不阻塞 merge）
 
-- [ ] 30. `max_context: 0` vs whisper 預設的 A/B。目前預設 `0` 是理論推導，
-         **尚未經真實語料驗證**（見 README「關於 max_context: 0」）。
-         建議語料：2–3s / 5–15s / 20–30s × 中文 / 英文 / 中英混用 /
-         技術術語 / 口語自我修正。觀察 CER·WER、術語命中率、重複、
-         拖尾幻覺、延遲
+- [ ] 30. `max_context` 的抗幻覺效果 A/B。**預設已於 v4.0.4 改為 `-1`
+         （不帶 `-mc`，使用 whisper 預設）**，因為真機實測證實 `-mc 0` 會讓
+         `initial_prompt` 完全失效——那個副作用不可接受。
+
+         但「關掉 context 能減少重複／拖尾幻覺」這個**原始假設本身仍未被
+         驗證**。若要重新評估，需涵蓋 2–3 秒 / 5–15 秒 / 20–30 秒，
+         中文、英文、中英混用、技術術語、口語自我修正等語料，
+         同時觀察術語命中率的損失。不阻塞 merge。
 
 ---
 

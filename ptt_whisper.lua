@@ -1,6 +1,12 @@
 -- ============================================================
 -- Push-to-Talk Whisper Dictation for Hammerspoon
--- v4.0.6
+-- v4.0.7
+--
+-- v4.0.7 修正：
+--   CB2.[Fix] restoreClipboard 只檢查 pcall 的第一個回傳值，忽略了
+--             writeDataForUTI 自己回傳的成功／失敗 boolean。寫入失敗會被
+--             算成成功，導致 (1) 純文字 fallback 不會觸發、(2) 更嚴重的是
+--             後續寫入會用 add=true 疊加到殘留的轉錄文字上
 --
 -- v4.0.6 修正：
 --   CB1.[Fix]  剪貼簿還原會吃掉多型別內容 —— writeDataForUTI 的 add 參數
@@ -70,7 +76,7 @@
 -- ============================================================
 
 -- ── 版本常數 ────────────────────────────────────────────────
-local VERSION = "4.0.6"
+local VERSION = "4.0.7"
 
 -- ── 設定區（Config）──────────────────────────────────────────
 
@@ -784,6 +790,34 @@ local function saveClipboard()
   return saved
 end
 
+-- [TESTABLE:restoreClipboardEntries] ← tests/test-lua-units.lua 會抽出這段獨立執行
+--- 把存下的剪貼簿內容逐一寫回。純函式：writer 由外部注入，不依賴 hs。
+---
+--- [CB2] pcall 的第一個回傳值只代表「沒有 throw」。writeDataForUTI 另外會
+--- 回傳 boolean 表示是否真的寫入成功，兩者都必須檢查。只看 pcall 的話，
+--- 寫入失敗仍會被算成功，後果有兩層：
+---   1. wrote 永遠 > 0，純文字 fallback 不會被觸發
+---   2. 更嚴重：第一筆失敗卻被計入時，第二筆會用 add=true，而此時剪貼簿上
+---      還是語音轉錄的文字（沒有任何一次成功的 add=false 清空過它），
+---      於是把使用者的原始內容「疊加」到轉錄文字上，而不是取代它
+---
+--- 因此 add 的依據必須是「已成功寫入幾筆」，不能用迴圈索引。
+---
+--- @param entries table  { { uti = string, data = any }, ... }
+--- @param writeFn function(uti, data, add) -> boolean
+--- @return number  成功寫入的型別數
+local function restoreClipboardEntries(entries, writeFn)
+  local wrote = 0
+  for _, entry in ipairs(entries) do
+    local callOk, writeOk = pcall(writeFn, entry.uti, entry.data, wrote > 0)
+    if callOk and writeOk then
+      wrote = wrote + 1
+    end
+  end
+  return wrote
+end
+-- [/TESTABLE]
+
 local function restoreClipboard(saved)
   if not saved or #saved == 0 then return end
   if #saved == 1 and saved[1].uti == "__plaintext_fallback__" then
@@ -791,21 +825,13 @@ local function restoreClipboard(saved)
     return
   end
 
-  -- [CB1] writeDataForUTI 的第 4 個參數 add 預設為 false，
-  -- 也就是「每次呼叫都先清空剪貼簿再寫入」。原本的迴圈沒帶這個參數，
-  -- 跑完只會剩下最後一個 UTI —— 從文件複製的多型別內容會被整個吃掉。
-  --
-  -- 真機實測（模擬從文件複製，4 個型別）：
-  --   不帶 add → getContents() = nil，只剩 public.html
-  --   帶 add   → getContents() 正確還原，4 個型別都在
-  --
-  -- 第一次寫入用 add=false（等同清空後寫入），之後一律 add=true 疊加。
-  local wrote = 0
-  for _, entry in ipairs(saved) do
-    local ok = pcall(hs.pasteboard.writeDataForUTI,
-                     nil, entry.uti, entry.data, wrote > 0)
-    if ok then wrote = wrote + 1 end
-  end
+  -- [CB1] writeDataForUTI 的第 4 個參數 add 預設為 false，也就是「每次呼叫
+  -- 都先清空剪貼簿再寫入」。不帶這個參數的迴圈跑完只會剩下最後一個 UTI，
+  -- 從文件複製的多型別內容會被整個吃掉。
+  local wrote = restoreClipboardEntries(saved, function(uti, data, add)
+    return hs.pasteboard.writeDataForUTI(nil, uti, data, add)
+  end)
+
   if wrote == 0 then
     -- 一個型別都寫不回去：至少把純文字救回來，不要留下空的剪貼簿
     appendErrorLog("restoreClipboard: 所有 UTI 都寫入失敗，改用純文字還原")

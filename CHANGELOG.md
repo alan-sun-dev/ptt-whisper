@@ -5,6 +5,68 @@
 
 ---
 
+## [4.0.7] — 剪貼簿寫入失敗的判定
+
+`transcribe.sh` 未變動，維持 2.10.2。
+
+### Fixed — `pcall` 的回傳值只檢查了一半
+
+v4.0.6 的還原迴圈是：
+
+```lua
+local ok = pcall(hs.pasteboard.writeDataForUTI, nil, uti, data, wrote > 0)
+if ok then wrote = wrote + 1 end
+```
+
+`pcall` 的第一個回傳值只代表「沒有 throw」。`writeDataForUTI` **另外**會
+回傳 boolean 表示是否真的寫入成功，這個值被忽略了。寫入失敗（回 `false`
+但不報錯）仍會被算成功，後果有兩層：
+
+1. `wrote` 永遠 > 0，`wrote == 0` 的純文字 fallback 不會被觸發
+2. **更嚴重**：第一筆失敗卻被計入時，第二筆會用 `add=true`，而此時剪貼簿上
+   還是語音轉錄的文字（沒有任何一次成功的 `add=false` 清空過它），
+   於是把使用者的原始內容**疊加**到轉錄文字上，而不是取代它
+
+修正為 `local callOk, writeOk = pcall(...)` 並同時檢查兩者。`add` 的依據
+維持「已成功寫入幾筆」（`wrote > 0`），不能改用迴圈索引——否則第一筆失敗
+後第二筆就會錯誤地疊加。
+
+### Testing
+
+還原迴圈抽成純函式 `restoreClipboardEntries(entries, writeFn)`，writer 由
+外部注入。production 傳入 `hs.pasteboard.writeDataForUTI`；測試傳入可控的
+假 writer，因此**失敗路徑可以進自動化測試**：
+
+| case | 情境 | 期望 |
+|---|---|---|
+| A | pcall 成功 + 回 true | 計入 |
+| B | pcall 成功 + 回 false | **不可**計入 |
+| C | writer throw | **不可**計入 |
+| D | 全部失敗 | `wrote = 0`，fallback 可達 |
+| — | 第一筆失敗 | 第二筆仍須 `add=false` |
+| — | 中間失敗 | 第三筆維持 `add=true`，不重新清空 |
+
+14 條斷言，執行的是從 `ptt_whisper.lua` 抽出的同一份出貨程式碼。
+把修正還原成舊寫法後，其中 5 條會失敗（含 `add` 那條），雙向驗證過。
+
+**為什麼失敗路徑只能靠注入測**：實測 `writeDataForUTI` 在這個 Hammerspoon
+版本用空 UTI、非法 UTI、不存在的 pasteboard 名稱**都回 `true`**，
+無法在真實 runtime 逼出 `false`。
+
+`./tests/run.sh` → **215 passed, 0 failed, 0 skipped**（前一版 201）。
+真機 `clipboard-roundtrip.lua` → 5 passed，4 個 UTI 全部還原。
+
+### Docs
+
+- `REAL_MAC_VALIDATION.md` 開頭改為準確的歷史敘述（原本仍寫「開發環境沒有
+  runtime」，但這台 Mac 已完成 fresh-install validation），並列出兩處
+  test double 與 production API 的對照
+- 第 22 項不再要求驗證初次啟動的 `503 loading`——原始碼與實測都證實
+  它在初次啟動時不可觀察
+- 第 30 項的 `max_context` 敘述更新（預設已是 `-1`）
+
+---
+
 ## [4.0.6] — 剪貼簿還原資料遺失
 
 ### Fixed — 剪貼簿還原會吃掉多型別內容
