@@ -71,9 +71,18 @@ else
   if [[ "$n_assert" -eq 0 ]]; then
     # 直譯器整個爆掉（語法錯誤、抽取失敗…）時，一條斷言都不會產出。
     # 若不特別處理，這個 section 會顯示 0 failed —— 看起來完全正常，
-    # 但實際上 43 條斷言一條都沒跑。這比「沒有 lua」更危險。
+    # 但實際上一條斷言都沒跑。這比「沒有 lua」更危險。
     _t_bad "Lua 單元測試沒有產出任何斷言（exit=${lua_rc}）— 直譯器或抽取失敗"
     sed 's/^/        /' "$T_DIR/luaout" | head -20
+  elif [[ "$lua_rc" -ne 0 ]] \
+       && ! grep -q '^FAIL ' "$T_DIR/luaout"; then
+    # 產出了一些斷言「之後」才崩潰：exit code 非 0，但沒有任何 FAIL 行。
+    # 這代表直譯器在中途爆掉，後面的斷言根本沒執行——而只看斷言數量
+    # 完全看不出來（實際發生過：51 條通過後崩潰，套件仍報 PASS）。
+    while IFS= read -r line; do _t_ok "$line"; done \
+      < <(grep '^PASS ' "$T_DIR/luaout" | cut -d' ' -f2-)
+    _t_bad "Lua 單元測試在第 ${n_assert} 條之後崩潰（exit=${lua_rc}）— 其餘斷言未執行"
+    grep -v '^PASS ' "$T_DIR/luaout" | sed 's/^/        /' | head -12
   else
     while IFS= read -r line; do _t_ok  "$line"; done \
       < <(grep '^PASS ' "$T_DIR/luaout" | cut -d' ' -f2-)
