@@ -100,6 +100,46 @@ PTT 的錄音通常只有 2~15 秒，量化帶來的精度差異感知不到，�
 若你想留一份 FP16 做比對，`bash ./models/download-ggml-model.sh small` 即可，
 兩者可以並存。
 
+#### small 還是 large-v3-turbo？取決於你講什麼
+
+2026-08-30 用**同一段真實錄音、同一組參數**做過 A/B：
+
+| | 純中文 | 中英混合技術術語 |
+|---|---|---|
+| `small-q5_1` | 2~4 個錯誤 | ✅ `Claude Code`、`Qwen`、`Kubernetes` 全對 |
+| `large-v3-turbo-q5_0` | ✅ 1 個錯誤 | ❌ `Cloude Code`、`QWIN`、`Kubernetes Nets` |
+
+**兩者各有勝場，不是誰比較好的問題。** 原因在架構：`large-v3-turbo` 是蒸餾
+版本，encoder 更大但 **decoder 從 32 層砍到 4 層**。encoder 負責聲學建模
+（中文同音字更準），decoder 負責跟隨 initial prompt（術語注入）——後者被
+大幅削弱，實測 turbo 有 prompt 與無 prompt 的輸出曾**逐字完全相同**。
+
+所以：
+
+- **主要講中文** → `large-v3-turbo-q5_0`（547MB，延遲約 1.2s，RAM ~840MB）
+- **主要講技術內容** → `small-q5_1`（181MB，延遲約 0.8s，RAM ~300MB）
+- **兩者都要** → 用 `lang_models` 依 App 分流，終端機／編輯器用 small +
+  術語 prompt，其他 App 用 turbo
+
+指定方式（不需要改程式碼）：
+
+```json
+{
+  "fallback_model": "ggml-small-q5_1.bin",
+  "lang_models": {
+    "_default": { "lang": "zh", "model": "ggml-large-v3-turbo-q5_0.bin" }
+  }
+}
+```
+
+> ⚠️ 沒有 `initial_prompt` 時 `large-v3-turbo` 會輸出**簡體字**，
+> 所以用 turbo 時 prompt 不能留空（見「術語注入」）。
+
+> ⚠️ Diagnostics 的「Model 檔案」顯示的是候選清單掃描的結果，
+> **不會反映 `lang_models[].model` 的覆寫**。要確認實際生效的模型，
+> 看 `~/.ptt-whisper/cache/` 的檔名，或 Console 執行
+> `PTTWhisper.getLangModelForCurrentApp()`。
+
 **模型的選用順序**（`ptt_whisper.lua` 與 `transcribe.sh` 兩端一致）：
 
 ```
@@ -471,6 +511,18 @@ whisper 對專有名詞、人名、中英混用詞的辨識率不高——「gRP
 
 - prompt 不是 LLM 的 system prompt，寫「請使用繁體中文」不會有效果，
   語言請用 `lang_models` 指定（見下方）。
+
+- **prompt 的結尾風格會被模仿。** 實測：結尾是英文詞彙列表 → 中文輸出
+  **完全沒有標點**；結尾是自然中文散文 → 標點正常。把術語**嵌進句子**
+  而不是列成清單：
+
+  ```json
+  "initial_prompt": "這是一段繁體中文的語音輸入。我們常常會談到 Claude Code 和 Qwen，也會用 vLLM 或 SGLang 來部署模型，有時候還會提到 ComfyUI 跟 Kubernetes。這些名詞請盡量拼寫正確。"
+  ```
+
+- **`large-v3-turbo` 對 prompt 的反應很弱**（decoder 只有 4 層）。實測它有
+  prompt 與無 prompt 的輸出曾逐字完全相同。若你重度依賴術語注入，
+  `small-q5_1` 反而是更好的選擇。
 - prompt 會進快取 key，改了 prompt 不會拿到舊結果。
 
 ### VAD（靜音偵測）
