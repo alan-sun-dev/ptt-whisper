@@ -10,6 +10,9 @@ done
 # t_reset_log 只清 arglog/reqlog；ptt_whisper_err.log 是累積的，
 # 「這一次沒有出現 X」這種斷言必須先把它清掉，否則會讀到上一次的內容。
 t_reset_ptt() { mkdir -p "$T_PTT"; : > "$T_PTT/ptt_whisper_err.log"; }
+# 快取是跨 t_run 累積的。斷言「這次存了什麼 key」之前必須清掉，
+# 否則會變成 CACHE HIT（不寫 CACHE STORE），key 抓不到而誤報。
+t_reset_cache() { rm -f "$T_PTT"/cache/*.txt 2>/dev/null || true; }
 
 # ── 預設關閉：終端機直接呼叫的行為不能被改變 ────────────────
 t_reset_log; t_reset_ptt; out=$(t_run)
@@ -68,15 +71,43 @@ if [[ -n "$FFMPEG_BIN" ]]; then
   assert_contains "正規化失敗 → 推理拿到的是原始檔" "$(t_args)" "$BAD"
   leftover=$(ls "$T_PTT"/ptt_norm_* 2>/dev/null | wc -l | tr -d ' ')
   assert_eq       "正規化失敗 → 暫存檔已清除" "$leftover" "0"
+
+  # ── [N5] 正規化失敗時，快取身分必須說實話 ──────────────────
+  # 失敗時轉錄的是「未正規化」的音訊。若仍存進 normalize=true 的身分，
+  # 之後 ffmpeg 恢復正常，查到的會是那筆髒資料——而且永遠不會被更新。
+  # 這與既有的「identity 描述實際完成推理的 backend」是同一條原則。
+  ckey() { grep -o 'CACHE STORE ([^)]*): [^ ]*' "$T_PTT/ptt_whisper_err.log" | tail -1 | sed 's/.*: //'; }
+
+  t_reset_log; t_reset_ptt; t_reset_cache
+  t_run "WHISPER_CACHE=true" -- "$BAD" >/dev/null
+  key_plain=$(ckey)
+
+  t_reset_log; t_reset_ptt; t_reset_cache
+  t_run "WHISPER_CACHE=true" "WHISPER_NORMALIZE=true" -- "$BAD" >/dev/null
+  key_failed=$(ckey)
+
+  t_reset_log; t_reset_ptt; t_reset_cache
+  t_run "WHISPER_CACHE=true" "WHISPER_NORMALIZE=true" >/dev/null   # 正常檔案，會成功
+  key_ok=$(ckey)
+
+  assert_eq "正規化失敗 → 存進 normalize=false 的身分（與沒要求時相同）" \
+            "$key_failed" "$key_plain"
+  [[ -n "$key_ok" && "$key_ok" != "$key_failed" ]] \
+    && _t_ok "正規化成功 → 身分與失敗時不同" \
+    || _t_bad "正規化成功時的 key 應與失敗時不同（key_ok=${key_ok}）"
 fi
 
 # ── 快取 identity 必須把正規化算進去 ────────────────────────
 if [[ -n "$FFMPEG_BIN" ]]; then
-  t_reset_log; t_reset_ptt; t_run "WHISPER_CACHE=true" >/dev/null
-  key_off=$(grep -o 'CACHE STORE ([^)]*): [^ ]*' "$T_PTT/ptt_whisper_err.log" | tail -1)
-  t_reset_log; t_reset_ptt; t_run "WHISPER_CACHE=true" "WHISPER_NORMALIZE=true" >/dev/null
-  key_on=$(grep -o 'CACHE STORE ([^)]*): [^ ]*' "$T_PTT/ptt_whisper_err.log" | tail -1)
-  assert_not_contains "開關正規化 → 快取 key 不同（不會互相污染）" "$key_off" "${key_on##*_}"
+  t_reset_log; t_reset_ptt; t_reset_cache
+  t_run "WHISPER_CACHE=true" >/dev/null
+  key_off=$(ckey)
+  t_reset_log; t_reset_ptt; t_reset_cache
+  t_run "WHISPER_CACHE=true" "WHISPER_NORMALIZE=true" >/dev/null
+  key_on=$(ckey)
+  [[ -n "$key_off" && -n "$key_on" && "$key_off" != "$key_on" ]] \
+    && _t_ok "開關正規化 → 快取 key 不同（不會互相污染）" \
+    || _t_bad "開關正規化的 key 應不同（off=${key_off} on=${key_on}）"
 fi
 
 t_teardown; t_summary "N 響度正規化"

@@ -5,6 +5,123 @@
 
 ---
 
+## [4.1.2] — 第三方 code review 抓到的問題
+
+`transcribe.sh` 2.11.0 → **2.12.0**。
+
+這一版全部來自把 v4.1.0/v4.1.1 送給不同家族的模型（Codex）做對抗式 review。
+作者原本明確聲稱「構造不出可達路徑」的那一項，被具體序列推翻了。
+
+### Fixed — N4：升級 timer 會被別次錄音取消
+
+`killFallbackTimer` / `killHardTimer` 原本是兩個模組級變數。作者的推理是
+「升級鏈 2.8 秒內跑完，期間 `currentState` 是 `TRANSCRIBING`，新錄音進不來」。
+
+**漏了誤觸路徑。** `stopRecordingAndTranscribe` 的順序是：
+
+```lua
+killTask(finishedRecordTask)          -- 先排好 2.0s / 2.8s 的升級鏈
+...
+if duration < MIN_RECORD_SEC then     -- 才檢查是不是誤觸
+  currentState = STATE.IDLE           -- 立刻回 IDLE
+  return
+```
+
+一次 0.04 秒的誤觸也會留下待處理的 timer，而狀態已經回到 IDLE——下一次錄音
+可以立刻開始，兩組 timer 搶同一對變數。log 裡真的有
+`recording: 按住 0.04s`，前提條件已在生產環境發生過。
+
+**修這個問題時發現同源的第二處**（review 未指出）：轉錄 task 的 exit
+callback 也在呼叫取消函式，會砍掉「錄音」那邊還沒觸發的升級鏈。而
+`killTask` 從來沒有用在轉錄 task 上——它自己根本沒有 timer 可取消。
+可達序列：錄音 X 的轉錄還在跑時發生誤觸 Y，Y 排下升級鏈；X 的轉錄結束就
+砍掉 Y 的升級鏈，Y 若卡死便再也沒人收。純粹的誤傷，已移除。
+
+改成 `killTimers[task] = { fallback, hard }`，閉包抓的是該 task 專屬的
+table，別次錄音永遠碰不到。
+
+### Fixed — N5：正規化失敗時，快取身分在說謊
+
+`variant_raw` 原本用 `NORMALIZE_ENABLED`（**要求值**）。正規化失敗時我們用
+原始音訊繼續轉錄——結果並沒有被正規化，卻存進了 `normalize=true` 的身分。
+之後 ffmpeg 恢復正常，查快取會一直命中那筆髒資料，而且永遠不會被更新。
+
+拆成兩個變數：`NORMALIZE_ENABLED`（要求）與 `NORMALIZE_APPLIED`（實際）。
+查快取時樂觀假設會成功；三條失敗路徑（ffmpeg 不在、`mktemp` 失敗、ffmpeg
+執行失敗）都把 `APPLIED` 打回 `false`，寫入時就會落在正確的身分底下。
+
+這正是 `transcribe.sh` 既有的做法——寫快取前會用 `ACTUAL_BACKEND` 重算一次
+identity。`docs/ARCHITECTURE.md` 早就寫了「identity 描述實際完成推理的
+backend，不是偏好」，v4.1.0 加正規化時沒有沿用這條原則。
+
+### Fixed — N6：reload 空窗會讓 ffmpeg 逃掉
+
+放開熱鍵後 `recordTask` 立刻設為 nil，行程只存在於區域變數裡，要等 3 秒
+逾時才進追蹤表。這段期間 `hs.reload()` 的話，`cleanup()` 兩邊都找不到它。
+
+（這個空窗 v4.1.0 之前就存在，不是新的迴歸——v4.1.0 只補上了 3 秒之後的
+部分。review 把它列為對本次 diff 的發現，沒做這層分流。）
+
+改成一啟動就登記，整段空窗消失。`timedOut` 拆成獨立旗標：若混為一談，
+每次錄音都會被當成 orphan 而無條件記錄 stderr，log 會迅速膨脹。
+
+### Fixed — N6b：追蹤表沒有上限
+
+SIGKILL 之後仍不死的行程實務上幾乎不存在，但沒有上限就是沒有上限。
+超過 8 筆就丟掉最舊的引用並記一行 log（丟掉只是不再追蹤，該行程此時早已
+被 SIGKILL 過）。
+
+### Added — N7：`last_model.txt`（實際完成推理的模型）
+
+v4.1.1 的「實際生效的模型」是**起飛前預測**，它無法預知某次轉錄會不會降級
+到 fallback model。`transcribe.sh` 現在把實際跑完推理的模型寫進
+`last_model.txt`（快取命中時從 cache key 還原），Diagnostics 新增對應項目，
+與目前設定不一致時給警告。做法比照既有的 `last_backend.txt`。
+
+### Fixed — 文件：`dynaudnorm` 的 15.5 秒不是 lookahead
+
+15.5 秒是視窗總長（500ms 幀 × 31 幀高斯視窗），但對稱視窗只預填一半，
+**實際啟動延遲約 7.5~8 秒**。原本的寫法暗示那是 lookahead，不精確。
+「錄 8 秒、硬砍後仍是 0 bytes」的實測結果不受影響。
+
+### Testing
+
+`./tests/run.sh` → **253 passed, 0 failed, 0 skipped**（前一版 248）。
+
+新增並**雙向驗證**的斷言：
+
+- 正規化失敗 → 存進 `normalize=false` 的身分（改回用要求值，該條確實會紅）
+- 正規化成功 → 身分與失敗時不同
+- `last_model.txt` 正常情況記主模型
+- `last_model.txt` 降級時記 **fallback**，不是主模型（改成只記主模型，
+  該條確實會紅）
+
+過程中專案自己的 linter 抓到新測試碼的一個 bash 陷阱：`"$key_ok）"` 的全形
+括號會被當成變數名的一部分，必須寫成 `"${key_ok}）"`。
+
+**N4 與 N6 沒有自動化斷言**——它們在 Hammerspoon 的非同步流程裡，測試套件
+模擬不了。只有 `luac -p` 的語法檢查，行為待真機驗證。
+
+### review 本身的評估
+
+同時記下這份第三方 review 的問題，避免下次照單全收：
+
+- **把既有問題當成本次 diff 的缺陷**（N6 的空窗 v4.1.0 之前就在）
+- **完全沒評新增的測試**（21 條斷言與 `FAKE_ECHO_SR` 的忠實度）
+- **沒發現證據就在 repo 裡**：N4 只論證到「理論可達」，但 log 裡就有
+  `按住 0.04s`
+- **對實驗設計的質疑停在「未證實」**，沒給出能了結的對照實驗
+- 引用的 11 個 file:line **全部準確**
+
+### 仍未解決
+
+**`-flush_packets` 的病因歸因尚未證實。** 所有緩衝實驗都用 `lavfi` 合成
+音源，缺少「真實 avfoundation 且不加 flag」的對照組。修法有效已由真機
+驗證（`size=65922`），但「不加 flag 時真實錄音會全程 0 bytes」目前只是
+高度合理的推論。
+
+---
+
 ## [4.1.1] — Diagnostics 報的是候選清單，不是實際用的模型
 
 `transcribe.sh` 未變動，維持 2.11.0。
@@ -114,7 +231,9 @@ whisper-cli 讀得動**（`processing 'REC.wav' (56320 samples, 3.5 sec)`）。
 | 加 `loudnorm` | **0 bytes** | 1.6s | 5.6s |
 | 加 `dynaudnorm` | **0 bytes** | **0 bytes** | **0 bytes** |
 
-（`dynaudnorm` 預設視窗 15.5 秒，比 loudnorm 糟得多，不要當替代品。）
+（`dynaudnorm` 不能當替代品：預設 500ms 幀 × 31 幀高斯視窗 ＝ 15.5 秒視窗，
+對稱視窗只預填一半，**實際啟動延遲約 7.5~8 秒**——不是 15.5 秒的 lookahead，
+但已比 loudnorm 的 2.4 秒糟得多，上表錄 8 秒仍是 0 bytes 就是這個緣故。）
 
 正規化本來就不需要即時做。改由 `transcribe.sh` 在 cache lookup 之後、推理
 之前執行（`WHISPER_NORMALIZE=true`），效果相同而沒有即時性限制。錄音端的

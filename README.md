@@ -271,7 +271,12 @@ Hammerspoon Console → hs.reload()
 > | 加上 `dynaudnorm` | **0 bytes** | **0 bytes** | **0 bytes** |
 >
 > `loudnorm` 因此於 v4.1.0 移出這條鏈，改由 `audio_normalize` 在錄完之後做
-> （效果相同，沒有即時性限制）。`dynaudnorm` 預設視窗長達 15.5 秒，不要用。
+> （效果相同，沒有即時性限制）。
+>
+> `dynaudnorm` 不能當替代品：預設 500ms 幀 × 31 幀高斯視窗 ＝ 15.5 秒視窗。
+> 對稱視窗只預填一半，所以**實際啟動延遲約 7.5~8 秒**（不是 15.5 秒的
+> lookahead）——但這已經比 loudnorm 的 2.4 秒糟得多，上表錄 8 秒仍是
+> 0 bytes 就是這個緣故。
 
 #### 關於 `max_context`
 
@@ -622,7 +627,7 @@ rm -rf ~/.ptt-whisper/cache/
 詳見 [CHANGELOG.md](CHANGELOG.md)
 
 **當前版本：**
-- `ptt_whisper.lua` v4.1.1
+- `ptt_whisper.lua` v4.1.2
 - `transcribe.sh` v2.10.2
 
 ---

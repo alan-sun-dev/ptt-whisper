@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================
-# transcribe.sh v2.11.0 — PTT Whisper 轉錄腳本
+# transcribe.sh v2.12.0 — PTT Whisper 轉錄腳本
 #
-# 搭配 ptt_whisper.lua v4.1.0 使用
+# 搭配 ptt_whisper.lua v4.1.2 使用
 # 用法：transcribe.sh /path/to/audio.wav [language] [model_path]
 #   language   — 覆寫 WHISPER_LANG（如 en, zh, ja）
 #                空字串 "" 或 "auto" = 不帶 -l，讓 whisper.cpp 自行偵測
@@ -11,6 +11,13 @@
 #                空字串 "" = 使用預設
 #   prompt     — 覆寫 WHISPER_PROMPT（initial prompt，注入術語/人名）
 # 輸出：轉錄文字寫到 stdout（單行，去頭尾空白，含 trailing newline）
+#
+# v2.12.0（code review 修正）：
+#  N5.[Fix]  快取身分改用「實際做成了正規化」而非「要求做正規化」。
+#            正規化失敗時我們用原始音訊繼續轉錄，舊版仍把結果存進
+#            normalize=true 的身分，之後 ffmpeg 恢復正常就會一直命中那筆
+#            髒資料。與既有的「identity 描述實際完成推理的 backend」同原則
+#  N7.[Feat] 記錄實際完成推理的模型到 last_model.txt（會反映 fallback 降級）
 #
 # v2.11.0（響度正規化移進管線）：
 #  N1.[Feat]  WHISPER_NORMALIZE=true 時，在 cache lookup 之後、推理之前做
@@ -116,6 +123,12 @@ AUTO_RESAMPLE="${WHISPER_AUTO_RESAMPLE:-true}"
 # 值的驗證在 LOG_FILE 定義之後才做（見下方 [N1] 驗證區塊）
 NORMALIZE_MODE="${WHISPER_NORMALIZE:-false}"
 NORMALIZE_ENABLED=false
+# [N5] 「要求做正規化」與「實際做成了」必須分開。
+# 正規化可能失敗（ffmpeg 不在、檔案解不開），此時我們用原始音訊繼續轉錄
+# ——那個結果就**不是**正規化過的，不能存進 normalize=true 的快取身分。
+# 這與既有的「cache identity 描述實際完成推理的 backend、不是偏好」
+# 是同一條原則（見 docs/ARCHITECTURE.md）。
+NORMALIZE_APPLIED=false
 # EBU R128 感知響度正規化。這裡是離線單檔處理，沒有即時性限制。
 NORMALIZE_FILTER="loudnorm=I=-16:TP=-1.5"
 
@@ -129,6 +142,10 @@ if (( CACHE_MAX > 500 )); then CACHE_MAX=500; fi
 
 # [F6] Fallback model
 FALLBACK_MODEL="${WHISPER_FALLBACK_MODEL:-}"
+# [N7] 實際完成推理的模型（可能是 fallback，不一定是設定的主模型）。
+# 與 last_backend.txt 同一條原則：Diagnostics 的「實際生效的模型」只能報
+# 「預期會用哪個」，它沒辦法預知未來某次轉錄會不會降級到 fallback。
+USED_MODEL=""
 
 # ── [P3] 推理參數 ────────────────────────────────────────────
 # initial prompt：注入術語 / 人名 / 中英混用詞，提升專有名詞辨識率
@@ -360,6 +377,8 @@ case "$NORMALIZE_MODE" in
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: invalid WHISPER_NORMALIZE='$NORMALIZE_MODE' (expected true/false)" >> "$LOG_FILE" 2>/dev/null || true
     ;;
 esac
+# [N5] 查快取時先樂觀假設會成功；真的失敗時再改回 false（見正規化區塊）
+NORMALIZE_APPLIED="$NORMALIZE_ENABLED"
 
 VAD_MODEL="${WHISPER_VAD_MODEL:-}"
 if [[ -z "$VAD_MODEL" ]]; then
@@ -445,7 +464,10 @@ cache_identity_for() {
   # 所有會改變輸出的參數都要進來
   # [N1] 正規化會改變實際送進推理的音訊，因此必須併入 variant hash，
   # 否則開關前後會互相污染彼此的快取。
-  variant_raw="${PROMPT}|${VAD_ENABLED}|${MAX_CONTEXT}|${backend}|${NORMALIZE_ENABLED}"
+  # [N5] 用 NORMALIZE_APPLIED（實際結果）而非 NORMALIZE_ENABLED（要求值）：
+  # 查快取時兩者相同（樂觀假設會成功）；寫入快取前若正規化失敗，
+  # 這裡已被改成 false，結果就會存進正確的身分底下。
+  variant_raw="${PROMPT}|${VAD_ENABLED}|${MAX_CONTEXT}|${backend}|${NORMALIZE_APPLIED}"
   variant_hash=$(printf '%s' "$variant_raw" | md5 -q 2>/dev/null \
     || printf '%s' "$variant_raw" | md5sum 2>/dev/null | cut -d' ' -f1 \
     || echo "")
@@ -473,6 +495,10 @@ cache_lookup_or_continue() {
   # 標記來源是快取，並保留是哪個 backend 的 namespace，
   # 否則開了 server 卻一直命中快取時，使用者看不出 server 有沒有在用
   printf 'cache:%s\n' "$backend" > "$PTT_DIR/last_backend.txt" 2>/dev/null || true
+  # [N7] cache key 的格式是 <audiohash>_<model>_<lang>_<variant>，
+  # 中間那段就是當初實際產生這筆結果的模型。
+  local cached_model="${CACHE_KEY#*_}"; cached_model="${cached_model%_*_*}"
+  [[ -n "$cached_model" ]] && printf 'cache:%s\n' "$cached_model" > "$PTT_DIR/last_model.txt" 2>/dev/null || true
   cat "$CACHE_FILE"
   exit 0
 }
@@ -549,6 +575,7 @@ fi
 if [[ "$NORMALIZE_ENABLED" == "true" ]]; then
   NORM_FFMPEG=$(find_ffmpeg)
   if [[ -z "$NORM_FFMPEG" ]]; then
+    NORMALIZE_APPLIED=false          # [N5] 沒做成 → 快取身分必須說實話
     echo "Warning: WHISPER_NORMALIZE=true but ffmpeg not found, skipping." >&2
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: normalize skipped, ffmpeg not found" >> "$LOG_FILE"
   else
@@ -558,9 +585,11 @@ if [[ "$NORMALIZE_ENABLED" == "true" ]]; then
     if [[ -n "$NORMALIZE_TMPFILE" ]] && "$NORM_FFMPEG" -y -i "$EFFECTIVE_AUDIO" \
          -af "$NORMALIZE_FILTER" -ac 1 -ar 16000 "$NORMALIZE_TMPFILE" 2>>"$LOG_FILE"; then
       EFFECTIVE_AUDIO="$NORMALIZE_TMPFILE"
+      NORMALIZE_APPLIED=true         # [N5] 確實做成了
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: normalized ($NORMALIZE_FILTER)" >> "$LOG_FILE"
     else
       # 正規化失敗不該讓整次轉錄失敗——沒正規化的音訊仍然可用
+      NORMALIZE_APPLIED=false        # [N5] 但結果不能冒充成正規化過的
       echo "Warning: normalize failed, using original audio." >&2
       echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: normalize failed, using original audio" >> "$LOG_FILE"
       rm -f "$NORMALIZE_TMPFILE" 2>/dev/null || true
@@ -572,6 +601,7 @@ fi
 # ── [F6] whisper.cpp 執行函式 ────────────────────────────────
 run_whisper() {
   local use_model="$1"
+  USED_MODEL="$use_model"      # [N7] 記下實際送進推理的模型
   local cmd=(
     "$WHISPER_BIN"
     -m "$use_model"
@@ -756,6 +786,12 @@ if [[ "$SERVER_USED" == "true" ]]; then
   printf 'server\n' > "$PTT_DIR/last_backend.txt" 2>/dev/null || true
 else
   printf 'cli\n' > "$PTT_DIR/last_backend.txt" 2>/dev/null || true
+fi
+# [N7] 同時記下實際完成推理的模型。server 路徑用 server 載入的那個。
+if [[ "$SERVER_USED" == "true" && -n "$SERVER_MODEL" ]]; then
+  printf '%s\n' "$(basename "$SERVER_MODEL")" > "$PTT_DIR/last_model.txt" 2>/dev/null || true
+elif [[ -n "$USED_MODEL" ]]; then
+  printf '%s\n' "$(basename "$USED_MODEL")" > "$PTT_DIR/last_model.txt" 2>/dev/null || true
 fi
 
 # ── 驗證輸出 ─────────────────────────────────────────────────
