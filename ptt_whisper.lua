@@ -1,5 +1,10 @@
 -- ============================================================
--- v4.1.0
+-- v4.1.1
+--
+-- v4.1.1 診斷：
+--   MD1.[Diag] Diagnostics 新增「實際生效的模型」。原本只報候選清單掃描的
+--              結果，而 lang_models 的 per-app 設定會蓋過它——真機上出現過
+--              顯示 small、實際跑 turbo 的落差
 --
 -- v4.1.0 —— 0 bytes 錄音的根治：
 --   N2.[Fix]  錄音加上 -flush_packets 1。沒有它，ffmpeg 會把整段音訊囤在
@@ -97,7 +102,7 @@
 -- ============================================================
 
 -- ── 版本常數 ────────────────────────────────────────────────
-local VERSION = "4.1.0"
+local VERSION = "4.1.1"
 
 -- ── 設定區（Config）──────────────────────────────────────────
 
@@ -1858,6 +1863,30 @@ local function runDiagnostics()
     local suffix = modelPath:match("%-(q[%w_]+)%.bin$")
     local tag = suffix and suffix:upper() or "FP16"
     return string.format("%s (%dMB) [%s]", modelPath, sizeMB, tag)
+  end)
+
+  -- 4b. [MD1] 實際生效的模型
+  --
+  -- 上面那一項報的是「候選清單掃描」的結果，但 lang_models 的 per-app 設定
+  -- 會蓋過它。真機上實際發生過：Diagnostics 顯示 ggml-small-q5_1.bin，
+  -- 實際每次轉錄用的是 lang_models._default 指定的 large-v3-turbo-q5_0。
+  -- 兩個數字都沒錯，只是報的是不同層級的東西——而使用者會拿這裡的資訊
+  -- 判斷「我現在到底在用哪個模型」，那就必須是實際生效的那個。
+  --
+  -- 語言一併顯示：它來自同一筆設定，而且 lang=auto 有記錄在案的坑
+  -- （會把中文判成英文並「翻譯」成英文，見 README）。
+  check("實際生效的模型", function()
+    local langOverride, modelOverride, appName = getLangModelForCurrentApp()
+    local source = (modelOverride and modelOverride ~= "")
+                   and "lang_models 指定" or "候選清單掃描"
+    local path = resolveModelPath(modelOverride)
+    local lang = langOverride or "auto ⚠️ 中文會被判成英文並翻譯"
+    if not path then
+      return string.format("!%s 不存在（%s，前景 App：%s）",
+        tostring(modelOverride), source, appName)
+    end
+    return string.format("%s — %s · lang=%s（前景 App：%s）",
+      path:match("[^/]+$") or path, source, lang, appName)
   end)
 
   -- 5. Fallback model

@@ -5,6 +5,53 @@
 
 ---
 
+## [4.1.1] — Diagnostics 報的是候選清單，不是實際用的模型
+
+`transcribe.sh` 未變動，維持 2.11.0。
+
+### Diagnostics — 新增「實際生效的模型」
+
+真機上撞到的落差：
+
+```
+Model 檔案      — /Users/…/models/ggml-small-q5_1.bin (181MB) [Q5_1]
+實際每次轉錄用的 — ggml-large-v3-turbo-q5_0.bin
+```
+
+兩個數字都沒錯。「Model 檔案」報的是**候選清單掃描**的結果，而
+`lang_models` 的 per-app 設定會蓋過它——這台機器的 `_default` 指定了 turbo。
+
+問題在於**使用者會拿 Diagnostics 判斷「我現在到底在用哪個模型」**，而它給
+的是錯的答案。這台機器的 turbo 是刻意選的（見 CHANGELOG v4.0.x 的真機 A/B：
+turbo 純中文勝、small 技術術語勝），拿錯資訊做判斷會直接推翻那個結論。
+
+新增一行報實際生效的那個，並標明來源：
+
+```
+✅ 實際生效的模型 — ggml-large-v3-turbo-q5_0.bin — lang_models 指定 · lang=zh（前景 App：Google Chrome）
+```
+
+語言一併顯示，因為它來自同一筆設定，而且 `lang: auto` 有記錄在案的坑——
+會把中文判成英文並「翻譯」成英文。沒設 lang 時這裡會直接標出來：
+
+```
+lang=auto ⚠️ 中文會被判成英文並翻譯
+```
+
+前景 App 也一起報，因為 per-app 設定的生效與否取決於它。
+
+### Testing
+
+`./tests/run.sh` → **248 passed, 0 failed, 0 skipped**（此版未新增斷言：
+`runDiagnostics` 依賴 `hs.application.frontmostApplication`，測試套件中無法
+取得前景 App）。
+
+真機驗證（2026-09-04 23:21，`hs.reload()` 後執行 Diagnostics）：
+新的一行如實顯示 `ggml-large-v3-turbo-q5_0.bin — lang_models 指定 · lang=zh`，
+與 log 中每次 `CACHE STORE` 的 model 一致。
+
+---
+
 ## [4.1.0] — 0 bytes 錄音的根治
 
 `transcribe.sh` 2.10.2 → **2.11.0**（新增響度正規化步驟）。

@@ -622,7 +622,7 @@ rm -rf ~/.ptt-whisper/cache/
 詳見 [CHANGELOG.md](CHANGELOG.md)
 
 **當前版本：**
-- `ptt_whisper.lua` v4.1.0
+- `ptt_whisper.lua` v4.1.1
 - `transcribe.sh` v2.10.2
 
 ---
