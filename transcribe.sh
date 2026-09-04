@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================
-# transcribe.sh v2.10.2 — PTT Whisper 轉錄腳本
+# transcribe.sh v2.11.0 — PTT Whisper 轉錄腳本
 #
-# 搭配 ptt_whisper.lua v4.0.4 使用
+# 搭配 ptt_whisper.lua v4.1.0 使用
 # 用法：transcribe.sh /path/to/audio.wav [language] [model_path]
 #   language   — 覆寫 WHISPER_LANG（如 en, zh, ja）
 #                空字串 "" 或 "auto" = 不帶 -l，讓 whisper.cpp 自行偵測
@@ -11,6 +11,14 @@
 #                空字串 "" = 使用預設
 #   prompt     — 覆寫 WHISPER_PROMPT（initial prompt，注入術語/人名）
 # 輸出：轉錄文字寫到 stdout（單行，去頭尾空白，含 trailing newline）
+#
+# v2.11.0（響度正規化移進管線）：
+#  N1.[Feat]  WHISPER_NORMALIZE=true 時，在 cache lookup 之後、推理之前做
+#             一次 loudnorm。原本掛在 ptt_whisper.lua 的錄音 -af 鏈上，
+#             但 loudnorm 需要 lookahead，會在濾波圖裡壓著約 2.4 秒音訊，
+#             ffmpeg 一旦沒能優雅結束那段就消失。移到這裡沒有即時性限制。
+#             已併入 cache 的 variant hash（會改變送進推理的音訊）。
+#             預設 false，終端機直接呼叫的行為不變。
 #
 # v2.10.2 修正（真機驗證抓到）：
 #  B1.[Fix]   run_whisper 導掉 stdout —— whisper-cli 同時印 stdout 與寫
@@ -94,6 +102,22 @@ if [[ ! "$TIMEOUT_SEC" =~ ^[0-9]+$ ]]; then
   TIMEOUT_SEC=60
 fi
 AUTO_RESAMPLE="${WHISPER_AUTO_RESAMPLE:-true}"
+
+# ── [N1] 錄音後的響度正規化 ──────────────────────────────────
+# loudnorm 原本掛在 ptt_whisper.lua 的錄音濾波鏈上（-af，即時套用）。
+# 問題是它需要 lookahead：實測會在濾波圖裡壓著約 2.4 秒的音訊還沒寫出去，
+# 一旦 ffmpeg 沒能優雅結束，那段就跟著消失（錄 2 秒 → 硬砍後 0 bytes）。
+#
+# 正規化本來就不必即時做。移到這裡（錄完之後、推理之前）結果完全一樣，
+# 卻讓錄音端只剩逐樣本即時的濾波器，不再囤積任何東西。
+#
+# 預設 false：直接在終端機呼叫 transcribe.sh 的行為維持不變；
+# ptt_whisper.lua 會明確帶 WHISPER_NORMALIZE=true。
+# 值的驗證在 LOG_FILE 定義之後才做（見下方 [N1] 驗證區塊）
+NORMALIZE_MODE="${WHISPER_NORMALIZE:-false}"
+NORMALIZE_ENABLED=false
+# EBU R128 感知響度正規化。這裡是離線單檔處理，沒有即時性限制。
+NORMALIZE_FILTER="loudnorm=I=-16:TP=-1.5"
 
 # [F4] 快取設定
 CACHE_ENABLED="${WHISPER_CACHE:-false}"
@@ -328,6 +352,15 @@ fi
 # ── [P3] VAD（Voice Activity Detection）────────────────────
 # 砍掉靜音段：短錄音提速明顯，且能從源頭減少 whisper 在靜音上的幻覺
 # （幻覺黑名單是事後補救，VAD 是治本）。
+# ── [N1] WHISPER_NORMALIZE 驗證（LOG_FILE 此時已就緒）──────
+case "$NORMALIZE_MODE" in
+  true)  NORMALIZE_ENABLED=true ;;
+  false) NORMALIZE_ENABLED=false ;;
+  *)
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: invalid WHISPER_NORMALIZE='$NORMALIZE_MODE' (expected true/false)" >> "$LOG_FILE" 2>/dev/null || true
+    ;;
+esac
+
 VAD_MODEL="${WHISPER_VAD_MODEL:-}"
 if [[ -z "$VAD_MODEL" ]]; then
   # 用 glob 掃描而非寫死檔名，才不會被 silero 版本號變動綁死
@@ -410,7 +443,9 @@ cache_identity_for() {
 
   model_name=$(basename "$MODEL")
   # 所有會改變輸出的參數都要進來
-  variant_raw="${PROMPT}|${VAD_ENABLED}|${MAX_CONTEXT}|${backend}"
+  # [N1] 正規化會改變實際送進推理的音訊，因此必須併入 variant hash，
+  # 否則開關前後會互相污染彼此的快取。
+  variant_raw="${PROMPT}|${VAD_ENABLED}|${MAX_CONTEXT}|${backend}|${NORMALIZE_ENABLED}"
   variant_hash=$(printf '%s' "$variant_raw" | md5 -q 2>/dev/null \
     || printf '%s' "$variant_raw" | md5sum 2>/dev/null | cut -d' ' -f1 \
     || echo "")
@@ -452,10 +487,14 @@ cache_lookup_or_continue "$PLANNED_BACKEND" || true
 
 # ── Cleanup trap ─────────────────────────────────────────────
 RESAMPLE_TMPFILE=""
+NORMALIZE_TMPFILE=""
 cleanup() {
   rm -f "${OUT_PREFIX}.txt" 2>/dev/null || true
   if [[ -n "$RESAMPLE_TMPFILE" && -f "$RESAMPLE_TMPFILE" ]]; then
     rm -f "$RESAMPLE_TMPFILE" 2>/dev/null || true
+  fi
+  if [[ -n "$NORMALIZE_TMPFILE" && -f "$NORMALIZE_TMPFILE" ]]; then
+    rm -f "$NORMALIZE_TMPFILE" 2>/dev/null || true
   fi
   # [CR13] 清理可能殘留的幻覺過濾暫存檔
   rm -f "$PTT_DIR"/hall_clean_*.tmp "$PTT_DIR"/hall_norm_*.tmp 2>/dev/null || true
@@ -464,6 +503,15 @@ cleanup() {
 }
 trap cleanup EXIT
 rm -f "${OUT_PREFIX}.txt" 2>/dev/null || true
+
+# ── [N1] ffmpeg 尋路（resample 與 normalize 共用）───────────
+find_ffmpeg() {
+  local cand
+  for cand in /opt/homebrew/bin/ffmpeg /usr/local/bin/ffmpeg /usr/bin/ffmpeg; do
+    [[ -x "$cand" ]] && { printf '%s' "$cand"; return 0; }
+  done
+  command -v ffmpeg 2>/dev/null || true
+}
 
 # ── Sample rate 檢查 + 自動 Resample ─────────────────────────
 EFFECTIVE_AUDIO="$AUDIO_FILE"
@@ -474,11 +522,7 @@ if command -v ffprobe &>/dev/null; then
   if [[ -n "$SR" && "$SR" != "16000" ]]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: detected ${SR}Hz" >> "$LOG_FILE"
     if [[ "$AUTO_RESAMPLE" == "true" ]]; then
-      FFMPEG_BIN=""
-      for ffcand in /opt/homebrew/bin/ffmpeg /usr/local/bin/ffmpeg /usr/bin/ffmpeg; do
-        [[ -x "$ffcand" ]] && { FFMPEG_BIN="$ffcand"; break; }
-      done
-      [[ -z "$FFMPEG_BIN" ]] && FFMPEG_BIN=$(command -v ffmpeg 2>/dev/null || true)
+      FFMPEG_BIN=$(find_ffmpeg)
 
       if [[ -n "$FFMPEG_BIN" ]]; then
         RESAMPLE_TMPFILE=$(mktemp "$PTT_DIR/ptt_resample_XXXXXX.wav") || RESAMPLE_TMPFILE=""
@@ -495,6 +539,32 @@ if command -v ffprobe &>/dev/null; then
       fi
     else
       echo "Warning: audio sample rate is ${SR}Hz, expected 16000Hz." >&2
+    fi
+  fi
+fi
+
+# ── [N1] 響度正規化（錄音後、推理前）────────────────────────
+# 位置很重要：在 cache lookup 之後（快取 key 算的是原始音檔的 hash），
+# 在推理之前（backend 拿到的是已經處理好的音訊，不必各自實作一次）。
+if [[ "$NORMALIZE_ENABLED" == "true" ]]; then
+  NORM_FFMPEG=$(find_ffmpeg)
+  if [[ -z "$NORM_FFMPEG" ]]; then
+    echo "Warning: WHISPER_NORMALIZE=true but ffmpeg not found, skipping." >&2
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: normalize skipped, ffmpeg not found" >> "$LOG_FILE"
+  else
+    NORMALIZE_TMPFILE=$(mktemp "$PTT_DIR/ptt_norm_XXXXXX.wav") || NORMALIZE_TMPFILE=""
+    # -ar 16000 不能省：loudnorm 內部以 192kHz 運作，不指定輸出取樣率的話
+    # 產出的檔案會變成 192kHz，下游整條管線都會跟著錯。
+    if [[ -n "$NORMALIZE_TMPFILE" ]] && "$NORM_FFMPEG" -y -i "$EFFECTIVE_AUDIO" \
+         -af "$NORMALIZE_FILTER" -ac 1 -ar 16000 "$NORMALIZE_TMPFILE" 2>>"$LOG_FILE"; then
+      EFFECTIVE_AUDIO="$NORMALIZE_TMPFILE"
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: normalized ($NORMALIZE_FILTER)" >> "$LOG_FILE"
+    else
+      # 正規化失敗不該讓整次轉錄失敗——沒正規化的音訊仍然可用
+      echo "Warning: normalize failed, using original audio." >&2
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: normalize failed, using original audio" >> "$LOG_FILE"
+      rm -f "$NORMALIZE_TMPFILE" 2>/dev/null || true
+      NORMALIZE_TMPFILE=""
     fi
   fi
 fi

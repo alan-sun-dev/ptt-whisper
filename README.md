@@ -211,7 +211,8 @@ Hammerspoon Console → hs.reload()
   "cache_enabled": false,
   "fallback_model": "ggml-tiny.bin",
 
-  "audio_filter_chain": "highpass=f=200,lowpass=f=5000,loudnorm=I=-16:TP=-1.5",
+  "audio_filter_chain": "highpass=f=200,lowpass=f=5000",
+  "audio_normalize": true,
 
   "initial_prompt": "Kubernetes, Terraform, gRPC, PostgreSQL, code review, deploy",
   "vad_enabled": "auto",
@@ -238,7 +239,8 @@ Hammerspoon Console → hs.reload()
 | `show_preview_alert` | bool | `true` | 轉錄完成時是否顯示預覽 alert |
 | `cache_enabled` | bool | `false` | 啟用轉錄結果快取 |
 | `fallback_model` | string | `""` | Fallback 模型檔名或完整路徑 |
-| `audio_filter_chain` | string | 見下方 | 錄音時的 FFmpeg `-af` 濾波器鏈，設為 `""` 停用 |
+| `audio_filter_chain` | string | 見下方 | 錄音時的 FFmpeg `-af` 濾波器鏈，設為 `""` 停用。**只放即時濾波器**，見下方 |
+| `audio_normalize` | bool | `true` | 錄音後的響度正規化（EBU R128），由 `transcribe.sh` 執行 |
 | `initial_prompt` | string | `""` | 全域術語表（見「術語注入」）|
 | `vad_enabled` | bool 或 `"auto"` | `"auto"` | 靜音偵測。`auto` = 支援且有 model 才啟用 |
 | `max_context` | number | `-1` | 跨段上下文 token 數。`-1` = 用 whisper 預設。**設 0 會讓 `initial_prompt` 失效**，見下方 |
@@ -247,16 +249,29 @@ Hammerspoon Console → hs.reload()
 | `server_port` | number | `8178` | Server 監聽埠，有效 1024~65535 |
 | `lang_models` | object | `{}` | 依 App Bundle ID 切換語言/模型/prompt。**主要講中文請明確設 `"lang": "zh"`，不要用 `"auto"`** |
 
-`audio_filter_chain` 預設值為 `highpass=f=200,lowpass=f=5000,loudnorm=I=-16:TP=-1.5`：
+`audio_filter_chain` 預設值為 `highpass=f=200,lowpass=f=5000`：
 
 | 濾波器 | 作用 |
 |--------|------|
 | `highpass=f=200` | 切除冷氣、馬路隆隆聲等低頻環境噪音 |
 | `lowpass=f=5000` | 切除電路嘶聲、風扇雜音（保留 4~5kHz 齒擦音頻帶）|
-| `loudnorm=I=-16:TP=-1.5` | EBU R128 感知響度正規化，防止音量忽大忽小 |
 
 可填入任何合法的 FFmpeg `-af` 參數。改動後用 Menubar → **Run Diagnostics**
 確認語法正確（診斷會以 `lavfi` 虛擬音源做 dry-run 驗證）。
+
+> ⚠️ **這條鏈只能放「逐樣本即時」的濾波器。**
+>
+> 任何需要 lookahead（先聽一段再決定）的濾波器都會在濾波圖裡壓著音訊不寫出，
+> 一旦 ffmpeg 沒能優雅結束，那段就跟著消失。實測（`-re` 即時速率、硬砍 ffmpeg）：
+>
+> | 濾波器鏈 | 錄 2s 保住 | 錄 4s 保住 | 錄 8s 保住 |
+> |---|---|---|---|
+> | `highpass,lowpass` | 2.5s | 4.5s | 8.5s |
+> | 加上 `loudnorm` | **0 bytes** | 1.6s | 5.6s |
+> | 加上 `dynaudnorm` | **0 bytes** | **0 bytes** | **0 bytes** |
+>
+> `loudnorm` 因此於 v4.1.0 移出這條鏈，改由 `audio_normalize` 在錄完之後做
+> （效果相同，沒有即時性限制）。`dynaudnorm` 預設視窗長達 15.5 秒，不要用。
 
 #### 關於 `max_context`
 
@@ -295,6 +310,7 @@ Run Diagnostics 的「config.json 驗證」也看得到。
 | `WHISPER_LANG` | `auto` | 預設語言（auto = 自動偵測）|
 | `WHISPER_TIMEOUT` | `60` | 轉錄逾時秒數 |
 | `WHISPER_AUTO_RESAMPLE` | `true` | 自動 resample 非 16kHz 音訊 |
+| `WHISPER_NORMALIZE` | `false` | `true` = 推理前做一次 `loudnorm`（Lua 端依 `audio_normalize` 自動帶入）|
 | `WHISPER_CACHE_MAX` | `50` | 快取保留筆數，有效 5~500（超出自動夾到範圍內）|
 | `WHISPER_PROMPT` | `""` | initial prompt（Lua 端會依 config 自動帶入）|
 | `WHISPER_PROMPT_MAX_BYTES` | `800` | prompt 長度上限，超過會從尾端截斷 |
@@ -606,7 +622,7 @@ rm -rf ~/.ptt-whisper/cache/
 詳見 [CHANGELOG.md](CHANGELOG.md)
 
 **當前版本：**
-- `ptt_whisper.lua` v4.0.8
+- `ptt_whisper.lua` v4.1.0
 - `transcribe.sh` v2.10.2
 
 ---

@@ -5,6 +5,188 @@
 
 ---
 
+## [4.1.0] — 0 bytes 錄音的根治
+
+`transcribe.sh` 2.10.2 → **2.11.0**（新增響度正規化步驟）。
+
+### 病根：錄音進行中，磁碟上的檔案是空的
+
+v4.0.8 的診斷在 2026-09-04 20:56 抓到第一份完整證據：
+
+```
+20:56:37  recording: 按住 5.01s
+20:56:38  killTask: SIGINT timeout, sent SIGTERM
+20:56:40  recording: ffmpeg 未結束（SIGINT 後 3.68s）
+20:56:40  ffmpeg 未在 3.0s 內結束，仍嘗試讀取錄音檔
+20:56:40  skipped: 錄音檔過小（0 bytes）（按住 5.01s）
+```
+
+順著這條線做了受控實驗（`-re` 即時速率、16kHz mono、合成音源），每 0.5 秒
+量一次磁碟上的檔案：
+
+```
+ 0.5s → 0 bytes（理論應有  16000）
+ ...
+ 6.0s → 0 bytes（理論應有 192000）
+```
+
+**錄了 6 秒，檔案從頭到尾都是 0 bytes。** 整段音訊待在 ffmpeg 的輸出緩衝區
+裡，要到乾淨關檔才一次寫出。
+
+這代表整個設計壓在一個我們控制不了的前提上：**只要 ffmpeg 沒有優雅地關閉，
+錄音就 100% 消失**——不是壞掉一部分，是全部。而它會不會乖乖關閉，取決於
+麥克風有沒有被別的程序搶走、藍牙裝置有沒有切換、系統是不是剛睡醒。
+
+（v4.0.9 草稿裡把原因寫成「WAV header 要等關檔才補寫」。那是錯的：ffmpeg
+用 `RIFF ffffffff` 佔位，header 沒補回去的檔案照樣解得動。真正的原因是輸出
+緩衝。）
+
+### Fixed — N2：錄音加上 `-flush_packets 1`
+
+叫 ffmpeg 每收到一段音訊就寫進磁碟，不要囤。實測（錄 3 秒後 `kill -9`）：
+
+| 寫法 | 執行中磁碟上 | 硬砍後保住 |
+|---|---|---|
+| 沒有 flush_packets | 0 bytes | **0 bytes** |
+| 有 flush_packets | 112,718 bytes | **112,718 bytes** |
+
+用 `ptt_whisper.lua` 實際組出來的 argv 逐字重跑（只把 avfoundation 麥克風
+換成合成音源），硬砍後的檔案是 16000Hz / mono / 3.52 秒，**真正的
+whisper-cli 讀得動**（`processing 'REC.wav' (56320 samples, 3.5 sec)`）。
+
+錄音從此隨時都是有效的，「停止錄音」不再是攸關成敗的關鍵步驟。
+
+### Fixed — N1：`loudnorm` 移出錄音濾波鏈
+
+`-flush_packets` 解決了輸出端，但濾波圖自己也會囤。`loudnorm` 要「先聽一段
+再決定音量」，實測壓著約 2.4 秒：
+
+| 濾波器鏈 | 錄 2s 保住 | 錄 4s 保住 | 錄 8s 保住 |
+|---|---|---|---|
+| `highpass,lowpass` | 2.5s | 4.5s | 8.5s |
+| 加 `loudnorm` | **0 bytes** | 1.6s | 5.6s |
+| 加 `dynaudnorm` | **0 bytes** | **0 bytes** | **0 bytes** |
+
+（`dynaudnorm` 預設視窗 15.5 秒，比 loudnorm 糟得多，不要當替代品。）
+
+正規化本來就不需要即時做。改由 `transcribe.sh` 在 cache lookup 之後、推理
+之前執行（`WHISPER_NORMALIZE=true`），效果相同而沒有即時性限制。錄音端的
+濾波鏈從此只放逐樣本即時的濾波器——這條規則已寫進 `docs/ARCHITECTURE.md`。
+
+`-ar 16000` 不能省：loudnorm 內部以 192kHz 運作，漏掉就會產出 192kHz 的檔案
+（已實測），而 whisper.cpp 只吃 16kHz、餵錯不會報錯只會給垃圾。已有迴歸測試
+守住，並雙向驗證過（拿掉 `-ar` 該條斷言確實會紅）。
+
+### Fixed — N3：SIGTERM 之後補上 SIGKILL
+
+以前不敢硬砍，因為硬砍等於毀掉整段錄音。有了 N2 就沒有這個顧慮，而留著卡死
+的 ffmpeg 反而更糟——它會繼續占住 AVFoundation 裝置，害下一次錄音也失敗。
+
+時間軸：SIGINT `0s` → SIGTERM `2.0s` → SIGKILL `2.8s` → 放棄等待 `3.0s`。
+`hs.task` 沒有提供 SIGKILL，用 `/bin/kill -9 <pid>` 送。
+
+### Fixed — B4：逾時路徑的訊息與 stderr
+
+- **不再一律報「請按住久一點」**。ffmpeg 沒結束而檔案又不足，跟「你按太短」
+  是完全不同的病；2026-09-04 那次使用者按住了 5.01 秒，舊訊息把追查方向帶
+  去完全錯誤的地方。
+- **逾時不再整段放棄**。有了 `-flush_packets`，磁碟上通常已經有幾乎完整的
+  音訊，照常轉錄並記錄「可能少了結尾片段」。
+  （v4.0.9 草稿的做法是直接放棄——那在還沒有 flush_packets 的前提下才正確。
+  前提變了，做法就跟著變。）
+- **留住逾時 task 的引用**。`hs.task` 一旦沒有 Lua 端引用就會被 GC，exit
+  callback 永遠不觸發、stderr 永遠拿不到——20 筆 `ffmpeg exit=` 記錄裡沒有
+  20:56:40 那一次，推測就是這個原因（未驗證）。orphan 一律附上 stderr。
+- **`cleanup()` 收掉滯留的 ffmpeg**，否則它會跨越 `hs.reload()` 繼續占住
+  麥克風。
+
+### Fixed — L1：兩處迴圈變數重新指派
+
+v4.0.8 在 `tailLines` 修過「不可重新指派 for 的迴圈變數」，但檔案裡其實有
+三處，當時只修了一處。剩下的在 `loadHallucinationsFromFile()` 與
+`runDiagnostics()`，害**整個檔案在 Lua 5.5 下無法載入**——也就是說 `luac -p`
+這道防線一直停在同一個錯誤上，後面的內容從來沒被檢查到。
+
+行為未變，已用真實資料對拍：現行 `hallucinations_builtin.txt` 跑新舊兩種
+寫法，43 條規則、集合內容逐項相同。
+
+### Testing
+
+`./tests/run.sh` → **248 passed, 0 failed, 0 skipped**（前一版 227）。
+
+新增 `tests/cases/25-normalize.sh`（21 條），涵蓋：預設關閉、明確開啟、
+送進推理的是正規化後的暫存檔、暫存檔清理、非法值、正規化失敗降級用原始
+音訊、快取 key 不互相污染、**輸出仍是 16kHz**。
+
+`fake-whisper-cli` 新增 `FAKE_ECHO_SR`：回報它實際收到的音檔取樣率。
+「送進推理的檔案是幾 Hz」必須是能斷言的事實，否則 `-ar` 這種坑會再長回來。
+
+`luac -p ptt_whisper.lua` 乾淨通過（L1 修好之後第一次真正跑完整份檔案）。
+
+#### 真機驗證（2026-09-04 23:10，macOS 26.6.2 · Hammerspoon 1.1.1）
+
+用 `tests/manual/freeze-ffmpeg.sh` 在真機逼出「ffmpeg 完全不回應訊號」的情境
+（`SIGSTOP` 凍住它——這正是 20:56 那次實際發生的狀態，見下）：
+
+```
+23:10:20  recording: 按住 8.34s
+23:10:22  killTask: SIGINT timeout, sent SIGTERM
+23:10:23  killTask: SIGTERM timeout, sent SIGKILL to pid 22903
+23:10:23  recording: ffmpeg exit=9 size=65922 bytes state=transcribing
+23:10:23  recording: ffmpeg stderr（尾端 12 行）
+23:10:23  recording: ffmpeg 已結束（SIGINT 後 2.88s）
+23:10:23  INFO: normalized (loudnorm=I=-16:TP=-1.5)
+23:10:24  CACHE STORE (cli): e52c1c20...
+```
+
+| 改動 | 驗證結果 |
+|---|---|
+| N2 `-flush_packets 1` | **`size=65922` bytes** —— 同情境下舊版必定是 `0 bytes` |
+| N3 SIGKILL 升級 | 2.88s 送出，`exit=9`（趕在 3.0s 放棄等待之前） |
+| N1 正規化移到事後 | `INFO: normalized`，whisper 收到 2.1 秒音訊 |
+| B4 stderr 補記錄 | 第一次拿到卡死錄音的 stderr，12 行 |
+| 整體 | **轉錄正常完成**，事後無任何 ffmpeg 殘留 |
+
+音訊只有 2.06 秒是測試設計使然（腳本在第 2 秒凍住 ffmpeg），不是資料遺失。
+
+#### 一併查明：ffmpeg 為什麼「不肯結束」
+
+驗證過程中在機器上發現 pid 68457 —— **就是 20:56 那次 0 bytes 失敗的
+ffmpeg，已存活 2 小時 08 分**，父行程 Hammerspoon，狀態 `STAT=T`。
+
+`T` 代表**已停止（suspended）**。停止中的行程不會處理訊號，SIGINT / SIGTERM
+只會排隊等著，什麼都不會發生。它不是「不理我們」，是**沒有在執行、沒辦法理**。
+
+實測確認（對受控行程送訊號）：
+
+```
+停住後狀態: TN
+送 SIGINT  之後: TN   ← 無效
+送 SIGTERM 之後: TN   ← 無效
+送 SIGKILL 之後: 已結束
+```
+
+**SIGKILL 是唯一能作用在已停止行程上的訊號**，所以 N3 不是額外的保險，
+而是這個情境下唯一能收掉它的手段；N2 則保證硬砍不毀資料。兩者互為前提。
+
+它為什麼會被停止，仍未查明（已排除 SIGTTIN：該行程沒有 controlling
+terminal、stdin 是 pipe）。但 v4.1.0 讓這個答案不再是必要條件。
+
+#### 已知的粗糙邊緣（不處理）
+
+被 SIGKILL 砍掉的 WAV，結尾會有半個沒寫完的取樣，ffmpeg 讀取時會抱怨
+`corrupt input packet in stream 0`，但照常處理完、whisper 也正常讀出。
+代價是最後幾毫秒——相對於以前整段消失，這個交換是划算的。
+
+### 升級注意
+
+- **快取會全部失效一次**：variant hash 新增了 normalize 欄位。
+- `config.json` 若自訂過 `audio_filter_chain` 且含 `loudnorm`，建議拿掉，
+  改用新的 `audio_normalize`（預設 `true`）。留著不會壞，但會重新引入 2.4
+  秒的囤積。
+
+---
+
 ## [4.0.8] — 錄音診斷
 
 `transcribe.sh` 未變動，維持 2.10.2。純診斷改動，不改變任何控制流程。

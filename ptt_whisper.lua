@@ -1,6 +1,21 @@
 -- ============================================================
--- Push-to-Talk Whisper Dictation for Hammerspoon
--- v4.0.8
+-- v4.1.0
+--
+-- v4.1.0 —— 0 bytes 錄音的根治：
+--   N2.[Fix]  錄音加上 -flush_packets 1。沒有它，ffmpeg 會把整段音訊囤在
+--             輸出緩衝區，錄音期間磁碟上「從頭到尾都是 0 bytes」，只要它
+--             沒能優雅關閉，整段錄音就全部消失。加上之後隨寫隨落地，
+--             kill -9 也保得住（實測 whisper-cli 讀得動）
+--   N1.[Fix]  loudnorm 從錄音濾波鏈移到 transcribe.sh 的事後處理。它需要
+--             lookahead，會在濾波圖裡壓著約 2.4 秒音訊（錄 2 秒 → 硬砍後
+--             仍是 0 bytes）。正規化本來就不必即時做
+--   N3.[Fix]  SIGTERM 之後補上 SIGKILL 升級。以前不敢硬砍是因為會毀掉錄音；
+--             有了 N2 就沒有這個顧慮，而留著卡死的 ffmpeg 會繼續占住麥克風
+--   B4.[Fix]  ffmpeg 逾時未結束時，留住 task 引用（hs.task 被 GC 會讓 exit
+--             callback 永遠不觸發，stderr 永遠拿不到）；錯誤訊息不再一律報
+--             「請按住久一點」——2026-09-04 那次使用者按住了 5.01 秒
+--   L1.[Fix]  另外兩處 for 迴圈變數重新指派（v4.0.8 只修了三處中的一處），
+--             使整個檔案在 Lua 5.5 下無法載入、luac -p 這道防線失效
 --
 -- v4.0.8 診斷：
 --   DX2.[Diag] 錄音結束時無論處於哪個狀態都記錄 ffmpeg 的 exit code、
@@ -82,7 +97,7 @@
 -- ============================================================
 
 -- ── 版本常數 ────────────────────────────────────────────────
-local VERSION = "4.0.8"
+local VERSION = "4.1.0"
 
 -- ── 設定區（Config）──────────────────────────────────────────
 
@@ -146,6 +161,12 @@ local PASTE_RESTORE_SEC = 0.6
 -- [B3] SIGINT 之後多久才升級成 SIGTERM。實測 ffmpeg 需要 0.7~0.9 秒收尾，
 -- 原本的 0.5 秒會在它寫完之前就把它砍掉，產生 0 bytes 的錄音檔。
 local KILL_FALLBACK_SEC = 2.0
+-- [N3] SIGTERM 之後多久才升級成 SIGKILL。
+-- 以前不敢硬砍，因為硬砍等於毀掉整段錄音；有了 -flush_packets，音訊已經在
+-- 磁碟上，硬砍最多只丟掉最後幾十毫秒。留著卡死的 ffmpeg 反而更糟——它會
+-- 繼續占住 AVFoundation 裝置，害下一次錄音也失敗。
+-- 時間點：SIGINT 0s → SIGTERM 2.0s → SIGKILL 2.8s → 放棄等待 3.0s
+local KILL_HARD_SEC = 0.8
 
 -- Log
 local MAX_LOG_SIZE      = 512 * 1024
@@ -160,11 +181,22 @@ local SOUND_REC_STOP    = "Pop"
 -- highpass=f=200  : 切除 200Hz 以下環境低頻噪音（冷氣、馬路隆隆聲）
 -- lowpass=f=5000  : 切除 5kHz 以上高頻嘶聲（電路雜音、風扇）
 --                   保留 4~5kHz 齒擦音頻帶（/s/, /ʃ/, /f/），避免英文辨識劣化
--- loudnorm=I=-16:TP=-1.5 : EBU R128 感知響度正規化（防止忽大忽小）
---   注意：loudnorm 在即時錄音（single-pass）模式下僅做近似正規化，
---   對 PTT 的短音訊（2~15s）已足夠，但不等同於雙 pass 的精確結果
+--
+-- [N1] loudnorm 已於 v4.1.0 從這裡移走，改由 transcribe.sh 在錄完之後做。
+-- 原因：loudnorm 要「先聽一段再決定音量」，會在濾波圖裡壓著約 2.4 秒的音訊
+-- 還沒寫出去。實測（-re 即時速率、硬砍 ffmpeg）：
+--     現行鏈（含 loudnorm）  錄 2s → 保住 0 bytes；錄 4s → 只保住 1.6s
+--     只留 highpass/lowpass  錄 2s → 保住 2.5s；錄 4s → 保住 4.5s
+-- 音量正規化本來就不需要即時做，錄完再做結果一樣，卻沒有這個囤積成本。
+-- （順帶一提 dynaudnorm 更糟：預設視窗 15.5 秒，錄 8s 仍保住 0 bytes。）
+--
+-- 這條鏈只放「逐樣本即時」的濾波器。任何需要 lookahead 的東西都不該放這裡。
 -- 設為 "" 可停用濾波器；config.json 可透過 audio_filter_chain 覆寫
-local AUDIO_FILTER_CHAIN = "highpass=f=200,lowpass=f=5000,loudnorm=I=-16:TP=-1.5"
+local AUDIO_FILTER_CHAIN = "highpass=f=200,lowpass=f=5000"
+
+-- [N1] 音量正規化（EBU R128）。錄音結束後由 transcribe.sh 執行，
+-- 不影響錄音當下的即時性。config.json 可透過 audio_normalize 關閉。
+local AUDIO_NORMALIZE = true
 
 -- UI
 local SHOW_PREVIEW_ALERT = true
@@ -253,6 +285,7 @@ local CONFIG_KNOWN_KEYS = {
   fallback_model = true,
   lang_models = true,
   audio_filter_chain = true,
+  audio_normalize = true,
   initial_prompt = true,
   vad_enabled = true,
   max_context = true,
@@ -372,6 +405,15 @@ local function validateConfig(config)
       end
     else
       warn("audio_filter_chain: expected string")
+    end
+  end
+
+  -- [N1] audio_normalize: boolean（錄音後的響度正規化，由 transcribe.sh 執行）
+  if config.audio_normalize ~= nil then
+    if type(config.audio_normalize) == "boolean" then
+      AUDIO_NORMALIZE = config.audio_normalize
+    else
+      warn("audio_normalize: expected boolean")
     end
   end
 
@@ -508,6 +550,11 @@ local transcribeTask   = nil
 local recordStartAt    = nil
 local cachedFFmpegPath = nil
 local killFallbackTimer = nil
+local killHardTimer     = nil
+-- [B4] 逾時仍未結束的 ffmpeg。必須留住引用：hs.task 一旦沒有 Lua 端引用就會
+-- 被 GC，連帶讓 exit callback 永遠不觸發、stderr 永遠拿不到。
+-- key = task, value = true。行程真正結束時由 exit callback 自行移除。
+local orphanRecordTasks = {}
 
 -- ── Menubar ─────────────────────────────────────────────────
 local menubarItem = hs.menubar.new()
@@ -733,25 +780,44 @@ local function killTask(task)
   if not task then return end
   pcall(function()
     if task:isRunning() then
-      task:interrupt()
+      task:interrupt()                                   -- SIGINT
       killFallbackTimer = hs.timer.doAfter(KILL_FALLBACK_SEC, function()
         killFallbackTimer = nil
         pcall(function()
           if task:isRunning() then
-            task:terminate()
+            task:terminate()                             -- SIGTERM
             appendErrorLog("killTask: SIGINT timeout, sent SIGTERM")
           end
+        end)
+        -- [N3] SIGTERM 也可能無效：ffmpeg 若卡在 AVFoundation 的阻塞讀取上，
+        -- 根本輪不到訊號處理。hs.task 沒有提供 SIGKILL，只能自己送。
+        killHardTimer = hs.timer.doAfter(KILL_HARD_SEC, function()
+          killHardTimer = nil
+          pcall(function()
+            if task:isRunning() then
+              local pid = task:pid()
+              if pid and pid > 0 then
+                runCommandAsync("/bin/kill", {"-9", tostring(pid)})
+                appendErrorLog(string.format(
+                  "killTask: SIGTERM timeout, sent SIGKILL to pid %d", pid))
+              end
+            end
+          end)
         end)
       end)
     end
   end)
 end
 
---- [P3] 取消 killTask 的 SIGTERM fallback timer
+--- [P3][N3] 取消 killTask 的 SIGTERM / SIGKILL 升級 timer
 local function cancelKillFallbackTimer()
   if killFallbackTimer then
     killFallbackTimer:stop()
     killFallbackTimer = nil
+  end
+  if killHardTimer then
+    killHardTimer:stop()
+    killHardTimer = nil
   end
 end
 
@@ -1355,8 +1421,9 @@ local function loadHallucinationsFromFile(path)
   local f = io.open(path, "r")
   if not f then return 0 end
   local count = 0
-  for line in f:lines() do
-    line = line:match("^%s*(.-)%s*$")  -- trim
+  -- 不要重新指派 for 的迴圈變數：Lua 5.5 起它是 const，會直接報錯。
+  for rawLine in f:lines() do
+    local line = rawLine:match("^%s*(.-)%s*$")  -- trim
     if line ~= "" and line:sub(1, 1) ~= "#" then
       -- 第一層：原始文字精確比對
       hallucinationSet[line] = true
@@ -1465,12 +1532,31 @@ local function startRecording()
     table.insert(recordArgs, "-af")
     table.insert(recordArgs, AUDIO_FILTER_CHAIN)
   end
-  for _, v in ipairs({ "-ac", "1", "-ar", "16000", RECORD_FILE }) do
+  -- [N2] -flush_packets 1 是這一版最重要的一行。
+  --
+  -- 沒有它，ffmpeg 會把整段音訊囤在輸出緩衝區，等乾淨關檔才一次寫出——
+  -- 實測（-re 即時速率、16kHz mono）錄音進行中磁碟上「從頭到尾都是 0 bytes」，
+  -- 錄 6 秒也一樣。也就是說：只要 ffmpeg 沒有優雅地關掉，整段錄音就全部消失。
+  -- 而它願不願意乖乖關掉，我們控制不了（麥克風被搶走、藍牙切換、系統剛睡醒）。
+  --
+  -- 加上之後，音訊隨寫隨落地。實測錄 3 秒後 kill -9：
+  --     沒有 flush_packets → 磁碟上 0 bytes
+  --     有   flush_packets → 磁碟上 112,718 bytes，whisper-cli 正常讀出 4.5 秒
+  -- WAV 的 RIFF 長度欄位停在 ffffffff 佔位值也沒關係，解碼器照樣讀得動。
+  for _, v in ipairs({ "-ac", "1", "-ar", "16000", "-flush_packets", "1",
+                       RECORD_FILE }) do
     table.insert(recordArgs, v)
   end
 
-  recordTask = hs.task.new(ffmpeg, function(exitCode, _, stderr)
+  -- [B4] 先宣告再指派，讓 callback 能引用到 task 自己（用來從 orphan 表移除）
+  local thisRecordTask
+  thisRecordTask = hs.task.new(ffmpeg, function(exitCode, _, stderr)
     cancelKillFallbackTimer()
+
+    -- [B4] 若這個行程曾被判定「逾時未結束」，此刻才是它真正的死亡時間點。
+    -- 放掉引用（否則表會無限成長），並在 log 標記，讓事後追查能把兩段對上。
+    local wasOrphan = orphanRecordTasks[thisRecordTask] and true or false
+    orphanRecordTasks[thisRecordTask] = nil
 
     -- [DX2] 錄音診斷：無論 ffmpeg 結束時處於哪個狀態都記錄結果。
     --
@@ -1484,11 +1570,14 @@ local function startRecording()
     local recSize = (recAttr and recAttr.size) or 0
     local expectedExit = (exitCode == 0 or exitCode == 255)
     appendErrorLog(string.format(
-      "recording: ffmpeg exit=%s size=%d bytes state=%s",
-      tostring(exitCode), recSize, tostring(currentState)))
+      "recording: ffmpeg exit=%s size=%d bytes state=%s%s",
+      tostring(exitCode), recSize, tostring(currentState),
+      wasOrphan and " (逾時後才結束)" or ""))
     -- 只有出問題時才附上 stderr——ffmpeg 每次都會印一大段橫幅，
     -- 無條件記錄會讓 log 迅速膨脹。
-    if (not expectedExit) or recSize < MIN_FILE_BYTES then
+    -- [B4] orphan 一律附上：它就是我們最想解釋、卻始終拿不到證據的那個案例，
+    -- 而它有可能以 exit=255 加正常檔案大小收場，兩個既有條件都不成立。
+    if wasOrphan or (not expectedExit) or recSize < MIN_FILE_BYTES then
       appendErrorLog("recording: ffmpeg stderr（尾端 12 行）\n"
                      .. tailLines(stderr, 12))
     end
@@ -1507,6 +1596,7 @@ local function startRecording()
       end)
     end
   end, recordArgs)
+  recordTask = thisRecordTask
 
   if recordTask:start() then
     playSound(SOUND_REC_START)
@@ -1547,18 +1637,41 @@ local function stopRecordingAndTranscribe()
   -- [B3] 等 ffmpeg 真正結束再檢查檔案，而不是固定延遲後就假設它寫完了。
   -- 原本固定等 FFMPEG_FLUSH_SEC(0.3s) 就檢查，但 ffmpeg 需要 0.7~0.9 秒收尾，
   -- 短錄音時檔案還是 0 bytes —— 真機三輪測試三次命中。
-  local function afterRecordingSettled()
+  --- @param timedOut boolean  ffmpeg 沒有在時限內結束（檔案可能少了結尾片段）
+  local function afterRecordingSettled(timedOut)
     if sid ~= sessionCounter then return end
     if currentState ~= STATE.TRANSCRIBING then return end
 
     local valid, errMsg = isRecordFileValid()
     if not valid then
-      abortToIdle(errMsg, {
-        log = string.format("skipped: %s（按住 %.2fs）", errMsg, duration),
-        alert = "⚠️ 沒有錄到聲音，請按住久一點再說話",
-        alertDur = 2,
-      })
+      -- [N2] 訊息要說對原因。ffmpeg 沒結束而檔案又不足，跟「你按太短」是
+      -- 完全不同的病；舊版一律報「請按住久一點」，把追查方向帶去錯的地方
+      -- （2026-09-04 那次使用者按住了 5.01 秒）。
+      if timedOut then
+        abortToIdle("Recording Failed", {
+          log = string.format(
+            "skipped: ffmpeg 未在 %.1fs 內結束，且%s（按住 %.2fs）",
+            RECORD_EXIT_TIMEOUT_SEC, errMsg, duration),
+          alert = "❌ 錄音程序沒有正常結束，本次已放棄",
+          alertDur = 3,
+        })
+      else
+        abortToIdle(errMsg, {
+          log = string.format("skipped: %s（按住 %.2fs）", errMsg, duration),
+          alert = "⚠️ 沒有錄到聲音，請按住久一點再說話",
+          alertDur = 2,
+        })
+      end
       return
+    end
+
+    -- [N2] 有 -flush_packets 之後，ffmpeg 沒結束不代表錄音沒了——音訊是隨寫
+    -- 隨落地的，磁碟上通常已經有幾乎完整的內容。與其整段丟掉，不如照常轉錄
+    -- 並記錄下來。（v4.0.9 的做法是直接放棄，那是在還沒有 flush_packets 的
+    -- 前提下才正確；前提變了，做法就要跟著變。）
+    if timedOut then
+      appendErrorLog(
+        "recording: ffmpeg 未結束，改用磁碟上已寫出的音訊（可能少了結尾片段）")
     end
 
     -- [CR1] 使用 runCommandAsync
@@ -1577,6 +1690,8 @@ local function stopRecordingAndTranscribe()
       HOME = os.getenv("HOME"),
     }
     if CACHE_ENABLED then env.WHISPER_CACHE = "true" end
+    -- [N1] 響度正規化交給 transcribe.sh 做（錄音端不再帶 loudnorm）
+    env.WHISPER_NORMALIZE = AUDIO_NORMALIZE and "true" or "false"
     if FALLBACK_MODEL ~= "" then env.WHISPER_FALLBACK_MODEL = FALLBACK_MODEL end
     -- [P3] 推理參數
     if promptText ~= "" then env.WHISPER_PROMPT = promptText end
@@ -1658,12 +1773,22 @@ local function stopRecordingAndTranscribe()
       appendErrorLog(string.format(
         "recording: ffmpeg %s（SIGINT 後 %.2fs）",
         exited and "已結束" or "未結束", hs.timer.secondsSinceEpoch() - killedAt))
+
+      -- [B4] ffmpeg 沒在時限內結束時，留住 task 引用：hs.task 一旦沒有 Lua
+      -- 端引用就會被 GC，exit callback 永遠不觸發，stderr 也就永遠拿不到。
+      -- 2026-09-04 唯一復現的那次，20 筆 exit 記錄裡一筆都沒有，推測就是
+      -- 這個原因。
       if not exited then
+        orphanRecordTasks[finishedRecordTask] = true
         appendErrorLog(string.format(
-          "ffmpeg 未在 %.1fs 內結束，仍嘗試讀取錄音檔", RECORD_EXIT_TIMEOUT_SEC))
+          "recording: ffmpeg 未在 %.1fs 內結束（stderr 待它結束時補記錄）",
+          RECORD_EXIT_TIMEOUT_SEC))
       end
-      -- 行程已結束，再留一點時間給檔案系統把資料落地
-      hs.timer.doAfter(FFMPEG_FLUSH_SEC, afterRecordingSettled)
+
+      -- 再留一點時間給檔案系統把資料落地
+      hs.timer.doAfter(FFMPEG_FLUSH_SEC, function()
+        afterRecordingSettled(not exited)
+      end)
     end)
 end
 
@@ -1813,8 +1938,9 @@ local function runDiagnostics()
     local count = 0
     local f = io.open(BUILTIN_HALLUCINATION_FILE, "r")
     if f then
-      for line in f:lines() do
-        line = line:match("^%s*(.-)%s*$")
+      -- 同上：迴圈變數在 Lua 5.5 是 const，不可重新指派
+      for rawLine in f:lines() do
+        local line = rawLine:match("^%s*(.-)%s*$")
         if line ~= "" and line:sub(1, 1) ~= "#" then count = count + 1 end
       end
       f:close()
@@ -1984,6 +2110,12 @@ local HOTKEY_MECHANISM = "(未綁定)"
 local function cleanup()
   if recordTask then pcall(function() recordTask:terminate() end) end
   if transcribeTask then pcall(function() transcribeTask:terminate() end) end
+  -- [B4] 滯留的 ffmpeg 仍占著 AVFoundation 裝置。reload 不收掉的話，
+  -- 它會跨越 reload 繼續卡住下一次錄音，而且再也沒有人持有它的引用。
+  for task in pairs(orphanRecordTasks) do
+    pcall(function() task:terminate() end)
+  end
+  orphanRecordTasks = {}
   cancelKillFallbackTimer()
   recordTask     = nil
   transcribeTask = nil
