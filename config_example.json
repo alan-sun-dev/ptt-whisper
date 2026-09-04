@@ -8,7 +8,8 @@
   "cache_enabled": false,
   "fallback_model": "ggml-tiny.bin",
 
-  "audio_filter_chain": "highpass=f=200,lowpass=f=5000,loudnorm=I=-16:TP=-1.5",
+  "audio_filter_chain": "highpass=f=200,lowpass=f=5000",
+  "audio_normalize": true,
 
   "initial_prompt": "Kubernetes, Terraform, gRPC, PostgreSQL, code review, deploy",
   "vad_enabled": "auto",

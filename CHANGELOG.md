@@ -5,6 +5,354 @@
 
 ---
 
+## [4.1.2] — 第三方 code review 抓到的問題
+
+`transcribe.sh` 2.11.0 → **2.12.0**。
+
+這一版全部來自把 v4.1.0/v4.1.1 送給不同家族的模型（Codex）做對抗式 review。
+作者原本明確聲稱「構造不出可達路徑」的那一項，被具體序列推翻了。
+
+### Fixed — N4：升級 timer 會被別次錄音取消
+
+`killFallbackTimer` / `killHardTimer` 原本是兩個模組級變數。作者的推理是
+「升級鏈 2.8 秒內跑完，期間 `currentState` 是 `TRANSCRIBING`，新錄音進不來」。
+
+**漏了誤觸路徑。** `stopRecordingAndTranscribe` 的順序是：
+
+```lua
+killTask(finishedRecordTask)          -- 先排好 2.0s / 2.8s 的升級鏈
+...
+if duration < MIN_RECORD_SEC then     -- 才檢查是不是誤觸
+  currentState = STATE.IDLE           -- 立刻回 IDLE
+  return
+```
+
+一次 0.04 秒的誤觸也會留下待處理的 timer，而狀態已經回到 IDLE——下一次錄音
+可以立刻開始，兩組 timer 搶同一對變數。log 裡真的有
+`recording: 按住 0.04s`，前提條件已在生產環境發生過。
+
+**修這個問題時發現同源的第二處**（review 未指出）：轉錄 task 的 exit
+callback 也在呼叫取消函式，會砍掉「錄音」那邊還沒觸發的升級鏈。而
+`killTask` 從來沒有用在轉錄 task 上——它自己根本沒有 timer 可取消。
+可達序列：錄音 X 的轉錄還在跑時發生誤觸 Y，Y 排下升級鏈；X 的轉錄結束就
+砍掉 Y 的升級鏈，Y 若卡死便再也沒人收。純粹的誤傷，已移除。
+
+改成 `killTimers[task] = { fallback, hard }`，閉包抓的是該 task 專屬的
+table，別次錄音永遠碰不到。
+
+### Fixed — N5：正規化失敗時，快取身分在說謊
+
+`variant_raw` 原本用 `NORMALIZE_ENABLED`（**要求值**）。正規化失敗時我們用
+原始音訊繼續轉錄——結果並沒有被正規化，卻存進了 `normalize=true` 的身分。
+之後 ffmpeg 恢復正常，查快取會一直命中那筆髒資料，而且永遠不會被更新。
+
+拆成兩個變數：`NORMALIZE_ENABLED`（要求）與 `NORMALIZE_APPLIED`（實際）。
+查快取時樂觀假設會成功；三條失敗路徑（ffmpeg 不在、`mktemp` 失敗、ffmpeg
+執行失敗）都把 `APPLIED` 打回 `false`，寫入時就會落在正確的身分底下。
+
+這正是 `transcribe.sh` 既有的做法——寫快取前會用 `ACTUAL_BACKEND` 重算一次
+identity。`docs/ARCHITECTURE.md` 早就寫了「identity 描述實際完成推理的
+backend，不是偏好」，v4.1.0 加正規化時沒有沿用這條原則。
+
+### Fixed — N6：reload 空窗會讓 ffmpeg 逃掉
+
+放開熱鍵後 `recordTask` 立刻設為 nil，行程只存在於區域變數裡，要等 3 秒
+逾時才進追蹤表。這段期間 `hs.reload()` 的話，`cleanup()` 兩邊都找不到它。
+
+（這個空窗 v4.1.0 之前就存在，不是新的迴歸——v4.1.0 只補上了 3 秒之後的
+部分。review 把它列為對本次 diff 的發現，沒做這層分流。）
+
+改成一啟動就登記，整段空窗消失。`timedOut` 拆成獨立旗標：若混為一談，
+每次錄音都會被當成 orphan 而無條件記錄 stderr，log 會迅速膨脹。
+
+### Fixed — N6b：追蹤表沒有上限
+
+SIGKILL 之後仍不死的行程實務上幾乎不存在，但沒有上限就是沒有上限。
+超過 8 筆就丟掉最舊的引用並記一行 log（丟掉只是不再追蹤，該行程此時早已
+被 SIGKILL 過）。
+
+### Added — N7：`last_model.txt`（實際完成推理的模型）
+
+v4.1.1 的「實際生效的模型」是**起飛前預測**，它無法預知某次轉錄會不會降級
+到 fallback model。`transcribe.sh` 現在把實際跑完推理的模型寫進
+`last_model.txt`（快取命中時從 cache key 還原），Diagnostics 新增對應項目，
+與目前設定不一致時給警告。做法比照既有的 `last_backend.txt`。
+
+### Fixed — 文件：`dynaudnorm` 的 15.5 秒不是 lookahead
+
+15.5 秒是視窗總長（500ms 幀 × 31 幀高斯視窗），但對稱視窗只預填一半，
+**實際啟動延遲約 7.5~8 秒**。原本的寫法暗示那是 lookahead，不精確。
+「錄 8 秒、硬砍後仍是 0 bytes」的實測結果不受影響。
+
+### Testing
+
+`./tests/run.sh` → **253 passed, 0 failed, 0 skipped**（前一版 248）。
+
+新增並**雙向驗證**的斷言：
+
+- 正規化失敗 → 存進 `normalize=false` 的身分（改回用要求值，該條確實會紅）
+- 正規化成功 → 身分與失敗時不同
+- `last_model.txt` 正常情況記主模型
+- `last_model.txt` 降級時記 **fallback**，不是主模型（改成只記主模型，
+  該條確實會紅）
+
+過程中專案自己的 linter 抓到新測試碼的一個 bash 陷阱：`"$key_ok）"` 的全形
+括號會被當成變數名的一部分，必須寫成 `"${key_ok}）"`。
+
+**N4 與 N6 沒有自動化斷言**——它們在 Hammerspoon 的非同步流程裡，測試套件
+模擬不了。只有 `luac -p` 的語法檢查，行為待真機驗證。
+
+### review 本身的評估
+
+同時記下這份第三方 review 的問題，避免下次照單全收：
+
+- **把既有問題當成本次 diff 的缺陷**（N6 的空窗 v4.1.0 之前就在）
+- **完全沒評新增的測試**（21 條斷言與 `FAKE_ECHO_SR` 的忠實度）
+- **沒發現證據就在 repo 裡**：N4 只論證到「理論可達」，但 log 裡就有
+  `按住 0.04s`
+- **對實驗設計的質疑停在「未證實」**，沒給出能了結的對照實驗
+- 引用的 11 個 file:line **全部準確**
+
+### 仍未解決
+
+**`-flush_packets` 的病因歸因尚未證實。** 所有緩衝實驗都用 `lavfi` 合成
+音源，缺少「真實 avfoundation 且不加 flag」的對照組。修法有效已由真機
+驗證（`size=65922`），但「不加 flag 時真實錄音會全程 0 bytes」目前只是
+高度合理的推論。
+
+---
+
+## [4.1.1] — Diagnostics 報的是候選清單，不是實際用的模型
+
+`transcribe.sh` 未變動，維持 2.11.0。
+
+### Diagnostics — 新增「實際生效的模型」
+
+真機上撞到的落差：
+
+```
+Model 檔案      — /Users/…/models/ggml-small-q5_1.bin (181MB) [Q5_1]
+實際每次轉錄用的 — ggml-large-v3-turbo-q5_0.bin
+```
+
+兩個數字都沒錯。「Model 檔案」報的是**候選清單掃描**的結果，而
+`lang_models` 的 per-app 設定會蓋過它——這台機器的 `_default` 指定了 turbo。
+
+問題在於**使用者會拿 Diagnostics 判斷「我現在到底在用哪個模型」**，而它給
+的是錯的答案。這台機器的 turbo 是刻意選的（見 CHANGELOG v4.0.x 的真機 A/B：
+turbo 純中文勝、small 技術術語勝），拿錯資訊做判斷會直接推翻那個結論。
+
+新增一行報實際生效的那個，並標明來源：
+
+```
+✅ 實際生效的模型 — ggml-large-v3-turbo-q5_0.bin — lang_models 指定 · lang=zh（前景 App：Google Chrome）
+```
+
+語言一併顯示，因為它來自同一筆設定，而且 `lang: auto` 有記錄在案的坑——
+會把中文判成英文並「翻譯」成英文。沒設 lang 時這裡會直接標出來：
+
+```
+lang=auto ⚠️ 中文會被判成英文並翻譯
+```
+
+前景 App 也一起報，因為 per-app 設定的生效與否取決於它。
+
+### Testing
+
+`./tests/run.sh` → **248 passed, 0 failed, 0 skipped**（此版未新增斷言：
+`runDiagnostics` 依賴 `hs.application.frontmostApplication`，測試套件中無法
+取得前景 App）。
+
+真機驗證（2026-09-04 23:21，`hs.reload()` 後執行 Diagnostics）：
+新的一行如實顯示 `ggml-large-v3-turbo-q5_0.bin — lang_models 指定 · lang=zh`，
+與 log 中每次 `CACHE STORE` 的 model 一致。
+
+---
+
+## [4.1.0] — 0 bytes 錄音的根治
+
+`transcribe.sh` 2.10.2 → **2.11.0**（新增響度正規化步驟）。
+
+### 病根：錄音進行中，磁碟上的檔案是空的
+
+v4.0.8 的診斷在 2026-09-04 20:56 抓到第一份完整證據：
+
+```
+20:56:37  recording: 按住 5.01s
+20:56:38  killTask: SIGINT timeout, sent SIGTERM
+20:56:40  recording: ffmpeg 未結束（SIGINT 後 3.68s）
+20:56:40  ffmpeg 未在 3.0s 內結束，仍嘗試讀取錄音檔
+20:56:40  skipped: 錄音檔過小（0 bytes）（按住 5.01s）
+```
+
+順著這條線做了受控實驗（`-re` 即時速率、16kHz mono、合成音源），每 0.5 秒
+量一次磁碟上的檔案：
+
+```
+ 0.5s → 0 bytes（理論應有  16000）
+ ...
+ 6.0s → 0 bytes（理論應有 192000）
+```
+
+**錄了 6 秒，檔案從頭到尾都是 0 bytes。** 整段音訊待在 ffmpeg 的輸出緩衝區
+裡，要到乾淨關檔才一次寫出。
+
+這代表整個設計壓在一個我們控制不了的前提上：**只要 ffmpeg 沒有優雅地關閉，
+錄音就 100% 消失**——不是壞掉一部分，是全部。而它會不會乖乖關閉，取決於
+麥克風有沒有被別的程序搶走、藍牙裝置有沒有切換、系統是不是剛睡醒。
+
+（v4.0.9 草稿裡把原因寫成「WAV header 要等關檔才補寫」。那是錯的：ffmpeg
+用 `RIFF ffffffff` 佔位，header 沒補回去的檔案照樣解得動。真正的原因是輸出
+緩衝。）
+
+### Fixed — N2：錄音加上 `-flush_packets 1`
+
+叫 ffmpeg 每收到一段音訊就寫進磁碟，不要囤。實測（錄 3 秒後 `kill -9`）：
+
+| 寫法 | 執行中磁碟上 | 硬砍後保住 |
+|---|---|---|
+| 沒有 flush_packets | 0 bytes | **0 bytes** |
+| 有 flush_packets | 112,718 bytes | **112,718 bytes** |
+
+用 `ptt_whisper.lua` 實際組出來的 argv 逐字重跑（只把 avfoundation 麥克風
+換成合成音源），硬砍後的檔案是 16000Hz / mono / 3.52 秒，**真正的
+whisper-cli 讀得動**（`processing 'REC.wav' (56320 samples, 3.5 sec)`）。
+
+錄音從此隨時都是有效的，「停止錄音」不再是攸關成敗的關鍵步驟。
+
+### Fixed — N1：`loudnorm` 移出錄音濾波鏈
+
+`-flush_packets` 解決了輸出端，但濾波圖自己也會囤。`loudnorm` 要「先聽一段
+再決定音量」，實測壓著約 2.4 秒：
+
+| 濾波器鏈 | 錄 2s 保住 | 錄 4s 保住 | 錄 8s 保住 |
+|---|---|---|---|
+| `highpass,lowpass` | 2.5s | 4.5s | 8.5s |
+| 加 `loudnorm` | **0 bytes** | 1.6s | 5.6s |
+| 加 `dynaudnorm` | **0 bytes** | **0 bytes** | **0 bytes** |
+
+（`dynaudnorm` 不能當替代品：預設 500ms 幀 × 31 幀高斯視窗 ＝ 15.5 秒視窗，
+對稱視窗只預填一半，**實際啟動延遲約 7.5~8 秒**——不是 15.5 秒的 lookahead，
+但已比 loudnorm 的 2.4 秒糟得多，上表錄 8 秒仍是 0 bytes 就是這個緣故。）
+
+正規化本來就不需要即時做。改由 `transcribe.sh` 在 cache lookup 之後、推理
+之前執行（`WHISPER_NORMALIZE=true`），效果相同而沒有即時性限制。錄音端的
+濾波鏈從此只放逐樣本即時的濾波器——這條規則已寫進 `docs/ARCHITECTURE.md`。
+
+`-ar 16000` 不能省：loudnorm 內部以 192kHz 運作，漏掉就會產出 192kHz 的檔案
+（已實測），而 whisper.cpp 只吃 16kHz、餵錯不會報錯只會給垃圾。已有迴歸測試
+守住，並雙向驗證過（拿掉 `-ar` 該條斷言確實會紅）。
+
+### Fixed — N3：SIGTERM 之後補上 SIGKILL
+
+以前不敢硬砍，因為硬砍等於毀掉整段錄音。有了 N2 就沒有這個顧慮，而留著卡死
+的 ffmpeg 反而更糟——它會繼續占住 AVFoundation 裝置，害下一次錄音也失敗。
+
+時間軸：SIGINT `0s` → SIGTERM `2.0s` → SIGKILL `2.8s` → 放棄等待 `3.0s`。
+`hs.task` 沒有提供 SIGKILL，用 `/bin/kill -9 <pid>` 送。
+
+### Fixed — B4：逾時路徑的訊息與 stderr
+
+- **不再一律報「請按住久一點」**。ffmpeg 沒結束而檔案又不足，跟「你按太短」
+  是完全不同的病；2026-09-04 那次使用者按住了 5.01 秒，舊訊息把追查方向帶
+  去完全錯誤的地方。
+- **逾時不再整段放棄**。有了 `-flush_packets`，磁碟上通常已經有幾乎完整的
+  音訊，照常轉錄並記錄「可能少了結尾片段」。
+  （v4.0.9 草稿的做法是直接放棄——那在還沒有 flush_packets 的前提下才正確。
+  前提變了，做法就跟著變。）
+- **留住逾時 task 的引用**。`hs.task` 一旦沒有 Lua 端引用就會被 GC，exit
+  callback 永遠不觸發、stderr 永遠拿不到——20 筆 `ffmpeg exit=` 記錄裡沒有
+  20:56:40 那一次，推測就是這個原因（未驗證）。orphan 一律附上 stderr。
+- **`cleanup()` 收掉滯留的 ffmpeg**，否則它會跨越 `hs.reload()` 繼續占住
+  麥克風。
+
+### Fixed — L1：兩處迴圈變數重新指派
+
+v4.0.8 在 `tailLines` 修過「不可重新指派 for 的迴圈變數」，但檔案裡其實有
+三處，當時只修了一處。剩下的在 `loadHallucinationsFromFile()` 與
+`runDiagnostics()`，害**整個檔案在 Lua 5.5 下無法載入**——也就是說 `luac -p`
+這道防線一直停在同一個錯誤上，後面的內容從來沒被檢查到。
+
+行為未變，已用真實資料對拍：現行 `hallucinations_builtin.txt` 跑新舊兩種
+寫法，43 條規則、集合內容逐項相同。
+
+### Testing
+
+`./tests/run.sh` → **248 passed, 0 failed, 0 skipped**（前一版 227）。
+
+新增 `tests/cases/25-normalize.sh`（21 條），涵蓋：預設關閉、明確開啟、
+送進推理的是正規化後的暫存檔、暫存檔清理、非法值、正規化失敗降級用原始
+音訊、快取 key 不互相污染、**輸出仍是 16kHz**。
+
+`fake-whisper-cli` 新增 `FAKE_ECHO_SR`：回報它實際收到的音檔取樣率。
+「送進推理的檔案是幾 Hz」必須是能斷言的事實，否則 `-ar` 這種坑會再長回來。
+
+`luac -p ptt_whisper.lua` 乾淨通過（L1 修好之後第一次真正跑完整份檔案）。
+
+#### 真機驗證（2026-09-04 23:10，macOS 26.6.2 · Hammerspoon 1.1.1）
+
+用 `tests/manual/freeze-ffmpeg.sh` 在真機逼出「ffmpeg 完全不回應訊號」的情境
+（`SIGSTOP` 凍住它——這正是 20:56 那次實際發生的狀態，見下）：
+
+```
+23:10:20  recording: 按住 8.34s
+23:10:22  killTask: SIGINT timeout, sent SIGTERM
+23:10:23  killTask: SIGTERM timeout, sent SIGKILL to pid 22903
+23:10:23  recording: ffmpeg exit=9 size=65922 bytes state=transcribing
+23:10:23  recording: ffmpeg stderr（尾端 12 行）
+23:10:23  recording: ffmpeg 已結束（SIGINT 後 2.88s）
+23:10:23  INFO: normalized (loudnorm=I=-16:TP=-1.5)
+23:10:24  CACHE STORE (cli): e52c1c20...
+```
+
+| 改動 | 驗證結果 |
+|---|---|
+| N2 `-flush_packets 1` | **`size=65922` bytes** —— 同情境下舊版必定是 `0 bytes` |
+| N3 SIGKILL 升級 | 2.88s 送出，`exit=9`（趕在 3.0s 放棄等待之前） |
+| N1 正規化移到事後 | `INFO: normalized`，whisper 收到 2.1 秒音訊 |
+| B4 stderr 補記錄 | 第一次拿到卡死錄音的 stderr，12 行 |
+| 整體 | **轉錄正常完成**，事後無任何 ffmpeg 殘留 |
+
+音訊只有 2.06 秒是測試設計使然（腳本在第 2 秒凍住 ffmpeg），不是資料遺失。
+
+#### 一併查明：ffmpeg 為什麼「不肯結束」
+
+驗證過程中在機器上發現 pid 68457 —— **就是 20:56 那次 0 bytes 失敗的
+ffmpeg，已存活 2 小時 08 分**，父行程 Hammerspoon，狀態 `STAT=T`。
+
+`T` 代表**已停止（suspended）**。停止中的行程不會處理訊號，SIGINT / SIGTERM
+只會排隊等著，什麼都不會發生。它不是「不理我們」，是**沒有在執行、沒辦法理**。
+
+實測確認（對受控行程送訊號）：
+
+```
+停住後狀態: TN
+送 SIGINT  之後: TN   ← 無效
+送 SIGTERM 之後: TN   ← 無效
+送 SIGKILL 之後: 已結束
+```
+
+**SIGKILL 是唯一能作用在已停止行程上的訊號**，所以 N3 不是額外的保險，
+而是這個情境下唯一能收掉它的手段；N2 則保證硬砍不毀資料。兩者互為前提。
+
+它為什麼會被停止，仍未查明（已排除 SIGTTIN：該行程沒有 controlling
+terminal、stdin 是 pipe）。但 v4.1.0 讓這個答案不再是必要條件。
+
+#### 已知的粗糙邊緣（不處理）
+
+被 SIGKILL 砍掉的 WAV，結尾會有半個沒寫完的取樣，ffmpeg 讀取時會抱怨
+`corrupt input packet in stream 0`，但照常處理完、whisper 也正常讀出。
+代價是最後幾毫秒——相對於以前整段消失，這個交換是划算的。
+
+### 升級注意
+
+- **快取會全部失效一次**：variant hash 新增了 normalize 欄位。
+- `config.json` 若自訂過 `audio_filter_chain` 且含 `loudnorm`，建議拿掉，
+  改用新的 `audio_normalize`（預設 `true`）。留著不會壞，但會重新引入 2.4
+  秒的囤積。
+
+---
+
 ## [4.0.8] — 錄音診斷
 
 `transcribe.sh` 未變動，維持 2.10.2。純診斷改動，不改變任何控制流程。

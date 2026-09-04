@@ -7,6 +7,9 @@
 #   FAKE_FAIL_MODELS   空白分隔的 model basename，命中就 exit 4
 #   FAKE_TEXT          輸出文字，預設 "hello world"
 #   FAKE_ECHO_MODEL    非空 → 輸出 "from:<model basename>"
+#   FAKE_ECHO_SR       非空 → 輸出 "sr:<實際收到的音檔取樣率>"（需要 ffprobe）
+#                      真實的 whisper.cpp 只吃 16kHz，餵錯取樣率結果會是垃圾，
+#                      所以「送進來的檔案是幾 Hz」是必須能斷言的事實
 set -u
 if [[ "${1:-}" == "--help" ]]; then
   echo "usage: whisper-cli [options] file0 file1 ..."
@@ -27,10 +30,11 @@ fi
 
 printf '%s\n' "$*" >> "${FAKE_ARGLOG:-/dev/null}"
 
-of=""; model=""; prev=""
+of=""; model=""; infile=""; prev=""
 for a in "$@"; do
   [[ "$prev" == "-of" ]] && of="$a"
   [[ "$prev" == "-m"  ]] && model="$a"
+  [[ "$prev" == "-f"  ]] && infile="$a"
   prev="$a"
 done
 mb=$(basename "${model:-none}")
@@ -42,6 +46,9 @@ done
 
 if [[ -n "${FAKE_ECHO_MODEL:-}" ]]; then
   text="from:$mb"
+elif [[ -n "${FAKE_ECHO_SR:-}" ]]; then
+  sr=$(ffprobe -v error -show_entries stream=sample_rate -of csv=p=0 "$infile" 2>/dev/null || echo "?")
+  text="sr:${sr:-?}"
 else
   text="${FAKE_TEXT:-hello world}"
 fi

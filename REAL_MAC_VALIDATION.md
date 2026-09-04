@@ -1,6 +1,6 @@
-# 真機驗證清單（v4.0.x）
+# 真機驗證清單（v4.0.x / v4.1.0）
 
-**狀態：A / B / C 三段已於 2026-08-30 在真實 Mac 上完成驗證。**
+**狀態：A / B / C 三段已於 2026-08-30 完成；F（錄音存活性）已於 2026-09-04 完成。**
 
 歷史脈絡：這份清單最初寫成時，開發環境沒有 Hammerspoon runtime 也沒有
 whisper.cpp runtime，因此所有 Hammerspoon 相關行為都只能靠靜態檢查。
@@ -80,6 +80,36 @@ Hammerspoon 版本用空 UTI、非法 UTI、不存在的 pasteboard 名稱都回
 - [x] 23. `/inference` 實測接受 `response_format` / `no_timestamps` /
        `prompt` / `max_context`（`max_context=abc` → HTTP 500，
        但 `transcribe.sh` 已先驗證不會送出）
+
+---
+
+## ✅ F. 錄音存活性（v4.1.0，2026-09-04 23:10 真機完成）
+
+環境：macOS 26.6.2 arm64 · Hammerspoon 1.1.1 · whisper.cpp `c4ac001` ·
+`ggml-large-v3-turbo-q5_0` + `ggml-silero-v5.1.2` · PTT Whisper v4.1.0
+
+驗證方式：`tests/manual/freeze-ffmpeg.sh`。它先在終端機等待，你再去按熱鍵
+——因為按住 Right Option 時 Enter 會變成 Option+Enter，沒辦法同時下指令。
+腳本偵測到錄音後讓它錄 3 秒，再用 `SIGSTOP` 凍住 ffmpeg，逼出「訊號完全
+無效」的情境。
+
+- [x] 31. `-flush_packets 1` 生效 —— 硬砍後 `size=65922 bytes`
+       （同情境下 v4.0.8 必定是 `0 bytes`）
+- [x] 32. SIGKILL 升級 —— `sent SIGKILL to pid 22903`，2.88s，`exit=9`，
+       趕在 3.0s 放棄等待之前
+- [x] 33. 卡死錄音仍然完成轉錄 —— whisper 收到 2.1 秒音訊，`CACHE STORE` 成功
+- [x] 34. 正規化在 `transcribe.sh` 執行 —— `INFO: normalized (loudnorm=...)`
+- [x] 35. 第一次取得卡死錄音的 ffmpeg stderr（12 行）
+- [x] 36. 事後無 ffmpeg 殘留
+
+### 一併查明的事
+
+`STAT=T`（已停止）的行程不處理訊號 —— SIGINT/SIGTERM 只會排隊。20:56 那次
+0 bytes 的 ffmpeg 就是這個狀態，存活了 2 小時 08 分。**SIGKILL 是唯一能作用
+在已停止行程上的訊號**，因此 N3 不是保險而是必要條件。
+
+它為什麼被停止仍未查明（已排除 SIGTTIN：無 controlling terminal、stdin 是
+pipe）。v4.1.0 讓這個答案不再是必要條件。
 
 ---
 

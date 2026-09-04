@@ -30,4 +30,22 @@ out=$(t_run); rc=$?
 assert_contains "找不到任何模型 → 明確錯誤訊息" "$(t_stderr)" "model not found"
 [[ $rc -ne 0 ]] && _t_ok "找不到模型 → 非零 exit" || _t_bad "找不到模型應回非零 exit"
 
+# ── [N7] last_model.txt：記錄「實際完成推理的模型」 ──────────
+# Diagnostics 的「實際生效的模型」只能報預期值，無法預知降級。
+# 這個檔案是事後事實，必須反映 fallback。
+# 上一個測試把沙箱裡的模型全刪了，這裡要重建。
+t_model ggml-small-q5_1.bin
+t_model ggml-tiny.bin
+t_reset_log; rm -f "$T_PTT/last_model.txt"
+t_run "FAKE_ECHO_MODEL=1" >/dev/null
+assert_eq "正常情況 → 記錄主模型" \
+  "$(cat "$T_PTT/last_model.txt" 2>/dev/null)" "ggml-small-q5_1.bin"
+
+t_reset_log; rm -f "$T_PTT/last_model.txt"
+out=$(t_run "FAKE_FAIL_MODELS=ggml-small-q5_1.bin" "FAKE_ECHO_MODEL=1" \
+            "WHISPER_FALLBACK_MODEL=ggml-tiny.bin")
+assert_eq "降級到 fallback → 記錄的是 fallback，不是主模型" \
+  "$(cat "$T_PTT/last_model.txt" 2>/dev/null)" "ggml-tiny.bin"
+assert_eq "（對照）輸出確實來自 fallback" "$out" "from:ggml-tiny.bin"
+
 t_teardown; t_summary "A model resolution"

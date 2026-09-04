@@ -14,7 +14,8 @@ Hotkey (Right Option)
   │
   ▼
 Audio Capture                        ptt_whisper.lua
-  └ ffmpeg -f avfoundation -af <聲學濾波器鏈> → ptt_record.wav
+  ├ ffmpeg -f avfoundation -af <即時濾波器鏈> -flush_packets 1 → ptt_record.wav
+  └ 濾波器鏈只放逐樣本即時的濾波器；需要 lookahead 的一律往後放
   │
   ▼
 Input validation                     transcribe.sh
@@ -30,12 +31,15 @@ Capability & parameter resolution
   │
   ▼
 Cache lookup ①                       key = audio hash + model + lang
-  └ 命中 → 直接輸出並結束                    + variant(prompt, VAD, max_context, backend)
+  └ 命中 → 直接輸出並結束                    + variant(prompt, VAD, max_context,
+                                                      backend, normalize)
   │
   ▼
 Pre-processing
   ├ sample-rate 檢查（ffprobe）
-  └ 非 16kHz → 自動 resample
+  ├ 非 16kHz → 自動 resample
+  └ 響度正規化（loudnorm，WHISPER_NORMALIZE=true 時）
+     失敗一律降級用原始音訊，不讓整次轉錄失敗
   │
   ▼
 ASR Dispatcher                       run_transcription()
@@ -76,6 +80,14 @@ Output Adapter                       ptt_whisper.lua
 
 - **Cache lookup 在 resample 之前。** hash 算的是原始音檔，所以命中時
   連 resample 都可以整個跳過。這是刻意的。
+- **音訊前處理分成兩段，分界是「需不需要 lookahead」。** 逐樣本即時的
+  （highpass / lowpass）留在錄音端；需要先聽一段才能決定的（loudnorm）
+  一律放到 Pre-processing。
+  理由不是效能，是**錄音的可存活性**：任何在濾波圖裡囤積音訊的東西，都會
+  在 ffmpeg 沒能優雅結束時把那段音訊一起帶走。實測 loudnorm 會壓著約 2.4
+  秒——錄 2 秒、硬砍 ffmpeg，磁碟上是 0 bytes。
+  同理，錄音端的 `-flush_packets 1` 不是調校參數而是正確性要求：少了它，
+  整段音訊會囤在輸出緩衝區，錄音期間磁碟上全程 0 bytes。
 - **Fallback 屬於 inference orchestration，不是後處理。** 它決定「由誰產生
   文字」，發生在文字產生之前。
 - **Cache identity 描述「實際完成推理的 backend」，不是「偏好」。**
@@ -87,7 +99,8 @@ Output Adapter                       ptt_whisper.lua
 
 一個 ASR backend 必須滿足下列全部條件：
 
-1. **只負責推理**。錄音、resample、清理、過濾、快取、貼上都不是它的事。
+1. **只負責推理**。錄音、resample、正規化、清理、過濾、快取、貼上都不是
+   它的事。
 2. **產出純文字到 `${OUT_PREFIX}.txt`**，交給下游。不得自行輸出到剪貼簿或
    直接貼上。
 3. **接受統一的參數**：`language`、`prompt`（initial prompt）、`max_context`。
