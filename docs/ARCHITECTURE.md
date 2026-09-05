@@ -60,6 +60,7 @@ Text Pipeline                        統一、與 backend 無關
   ├ cleanup（移除 whisper 特殊標記 [BLANK_AUDIO] 等）
   ├ hallucination guard（exact → normalized 兩層）
   ├ 重複標點檢查
+  ├ 中文標點轉全形（僅在前一字為漢字時）
   ├ glossary                         ◇ planned extension point（尚未實作）
   └ OpenCC 簡繁轉換                   ◇ planned extension point（尚未實作）
   │
@@ -92,6 +93,15 @@ Output Adapter                       ptt_whisper.lua
   文字」，發生在文字產生之前。
 - **Cache identity 描述「實際完成推理的 backend」，不是「偏好」。**
   preference 是 server 但實際降級到 CLI 時，結果寫進 CLI 的 namespace。
+- **中文標點轉全形要求「前後都是漢字」。** whisper 的輸出有固定偏差：句號給
+  全形，逗號與問號給半形。但判別式必須看**語言脈絡**而不只是文字系統——
+  初版只檢查前一個字，會把 `SELECT 姓名, age` 改成 `SELECT 姓名， age`：
+  逗號前面確實是漢字，但那個逗號屬於 ASCII 語法。
+  句末的 `?` `!` 才放寬成「後面是漢字或字串結尾」；`,` `;` `:` 不放寬到
+  結尾，因為中文散文不會用逗號結尾，結尾的逗號分號比較可能是程式碼。
+  半形句點一律不碰（與小數點無法區分，且 whisper 本來就輸出全形句號）。
+  **只涵蓋中文**：日文的逗號是「、」不是「，」，放寬到假名會產生錯誤的日文。
+  誤轉的代價遠高於漏轉。
 - **Text Pipeline 之後的所有步驟都與 backend 無關。** 這是整個架構的重點：
   換 backend 不該影響文字處理，新增文字處理不該要求每個 backend 各做一次。
 
