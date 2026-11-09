@@ -1,5 +1,15 @@
 -- ============================================================
--- v4.1.3
+-- v4.2.0
+--
+-- v4.2.0 —— 錄音裝置由「名稱」指定：
+--   DEV1.[Fix] `-i :0` 指的是「第幾個裝置」不是「哪一個裝置」。裝置清單會
+--              隨 iPhone Continuity / Teams 虛擬裝置插拔而重排，`:0` 就指到
+--              別的東西。真機 2026-09-05 六次失敗的根因：拿到的裝置宣稱
+--              24-bit 卻給不完整的封包，ffmpeg 丟掉每一個封包，錄音停在約
+--              3 秒且卡在錯誤迴圈連訊號都不理。改用 audio_device 指定名稱，
+--              啟動時解析成索引並快取，偵測到壞封包自動失效重算
+--   DEV2.[Fix] 偵測到 Invalid PCM packet 時明確報錯，不再把垃圾音訊送進
+--              whisper——舊行為是靜默地給一段爛錄音，使用者只看到「沒文字」
 --
 -- v4.1.3：本檔未變動，僅同步版本號。實際改動在 transcribe.sh v2.13.0
 --         （中文標點轉全形，見 CHANGELOG）
@@ -117,7 +127,7 @@
 -- ============================================================
 
 -- ── 版本常數 ────────────────────────────────────────────────
-local VERSION = "4.1.3"
+local VERSION = "4.2.0"
 
 -- ── 設定區（Config）──────────────────────────────────────────
 
@@ -193,6 +203,26 @@ local MAX_LOG_SIZE      = 512 * 1024
 local MAX_LOG_FILES     = 5
 
 -- 音訊
+-- [DEV1] 錄音裝置。
+--
+-- `:0` 指的是「AVFoundation 清單裡的第幾個」，**不是特定裝置**。真機上的
+-- 清單會隨著裝置插拔重排：
+--     [0] Studio Display XDR麥克風
+--     [1] iPhone16麥克風              ← Continuity 連上時出現
+--     [2] Microsoft Teams Audio       ← Teams 載入虛擬裝置時出現
+-- 索引一重排，`:0` 就指到別的東西去。實測後果（2026-09-05，六次）：
+--     [pcm_s24le] Invalid PCM packet, data has size 2 but at least a size of 3
+--     [dec:pcm_s24le] Decoding error: Invalid data found when processing input
+-- 裝置宣稱 24-bit（每取樣 3 bytes）卻只給 2 bytes，ffmpeg 把**每一個封包都
+-- 丟掉**，於是檔案停在約 3 秒不再長大，而且它卡在錯誤迴圈裡連 SIGINT/SIGTERM
+-- 都不理，最後只能 SIGKILL。使用者看到的是「錄音成功但沒有文字」。
+--
+-- 因此改成用**裝置名稱**指定。ffmpeg 的 avfoundation 沒有提供「用名稱選取」
+-- 的選項（`-audio_device_index` 仍然是索引，只用於同名裝置），所以必須自己
+-- 解析清單把名稱轉成索引。
+--
+-- audio_device 留空 = 沿用舊行為（第一個裝置），向後相容。
+local AUDIO_DEVICE_NAME = ""
 local AUDIO_DEVICE      = ":0"
 local SOUND_REC_START   = "Tink"
 local SOUND_REC_STOP    = "Pop"
@@ -306,6 +336,7 @@ local CONFIG_KNOWN_KEYS = {
   cache_enabled = true,
   fallback_model = true,
   lang_models = true,
+  audio_device = true,
   audio_filter_chain = true,
   audio_normalize = true,
   initial_prompt = true,
@@ -427,6 +458,16 @@ local function validateConfig(config)
       end
     else
       warn("audio_filter_chain: expected string")
+    end
+  end
+
+  -- [DEV1] audio_device: string（錄音裝置「名稱」，"" = 用第一個裝置）
+  if config.audio_device ~= nil then
+    if type(config.audio_device) == "string" then
+      AUDIO_DEVICE_NAME = config.audio_device
+      cachedAudioDeviceArg = nil          -- 設定變了就重新解析
+    else
+      warn("audio_device: expected string")
     end
   end
 
@@ -571,6 +612,10 @@ local recordTask       = nil
 local transcribeTask   = nil
 local recordStartAt    = nil
 local cachedFFmpegPath = nil
+-- [DEV1] 解析過的錄音裝置參數（如 ":0"）。裝置清單重排時失效重算。
+local cachedAudioDeviceArg = nil
+-- [DEV1] 上一次錄音是否因為裝置送出壞封包而失敗。key = sid。
+local deviceErrorSessions = {}
 -- [N4] 升級 timer 改成「每個 task 自己一份」，key = task。
 --
 -- 原本是兩個模組級變數，兩次錄音重疊時會互相覆蓋／取消。第三方 review
@@ -812,6 +857,33 @@ end
 -- [/TESTABLE]
 
 --- [CR1] 列出音訊裝置（改用 runCommandSync，不再拼 shell 字串）
+-- [TESTABLE:parseAudioDevices] ← tests/test-lua-units.lua 會抽出這段獨立執行
+--- 從 `ffmpeg -f avfoundation -list_devices true` 的輸出解析出音訊裝置清單。
+---
+--- 只取「AVFoundation audio devices:」之後的項目——視訊裝置用的是完全相同的
+--- `[N] 名稱` 格式，不分段會把攝影機也算進來，索引就全錯。
+--- @param output string|nil  ffmpeg 的 stderr
+--- @return table  { [index] = name }，index 是 ffmpeg 用的數字（字串形式）
+local function parseAudioDevices(output)
+  local devices = {}
+  if type(output) ~= "string" then return devices end
+  local inAudio = false
+  for line in output:gmatch("[^\n]+") do
+    if line:find("AVFoundation audio devices:", 1, true) then
+      inAudio = true
+    elseif line:find("AVFoundation video devices:", 1, true) then
+      inAudio = false
+    elseif inAudio then
+      local idx, name = line:match("%[(%d+)%]%s+(.+)$")
+      if idx and name then
+        devices[idx] = (name:gsub("%s+$", ""))
+      end
+    end
+  end
+  return devices
+end
+-- [/TESTABLE]
+
 local function listAudioDevices()
   local ffmpeg = findFFmpeg()
   if not ffmpeg then print("❌ ffmpeg not found"); return end
@@ -823,6 +895,52 @@ local function listAudioDevices()
   print("==================================")
 end
 
+--- [DEV1] 把設定裡的裝置「名稱」解析成 ffmpeg 要的「索引」參數。
+--- 結果會快取；裝置清單重排時由 invalidateAudioDevice() 失效。
+--- @return string  給 -i 用的參數，例如 ":0"
+--- @return string|nil  解析失敗時的說明（此時回傳值會退回預設裝置）
+local function resolveAudioDevice()
+  if cachedAudioDeviceArg then return cachedAudioDeviceArg, nil end
+  if AUDIO_DEVICE_NAME == "" then
+    cachedAudioDeviceArg = AUDIO_DEVICE
+    return cachedAudioDeviceArg, nil
+  end
+  local ffmpeg = findFFmpeg()
+  if not ffmpeg then
+    return AUDIO_DEVICE, "找不到 ffmpeg，無法解析裝置名稱"
+  end
+  local output = runCommandSync(ffmpeg,
+    {"-f", "avfoundation", "-list_devices", "true", "-i", ""},
+    {stderr = true})
+  local devices = parseAudioDevices(output)
+  for idx, name in pairs(devices) do
+    if name == AUDIO_DEVICE_NAME then
+      cachedAudioDeviceArg = ":" .. idx
+      appendErrorLog(string.format(
+        "audio device: 「%s」→ %s", AUDIO_DEVICE_NAME, cachedAudioDeviceArg))
+      return cachedAudioDeviceArg, nil
+    end
+  end
+  local available = {}
+  for idx, name in pairs(devices) do
+    table.insert(available, string.format("[%s] %s", idx, name))
+  end
+  table.sort(available)
+  return AUDIO_DEVICE, string.format(
+    "找不到裝置「%s」，退回 %s。目前可用：%s",
+    AUDIO_DEVICE_NAME, AUDIO_DEVICE,
+    #available > 0 and table.concat(available, "、") or "（列不出來）")
+end
+
+--- [DEV1] 讓下一次錄音重新解析裝置索引
+local function invalidateAudioDevice(why)
+  if cachedAudioDeviceArg then
+    appendErrorLog("audio device: 快取失效（" .. (why or "?") .. "），下次錄音重新解析")
+  end
+  cachedAudioDeviceArg = nil
+end
+
+PTTWhisper.parseAudioDevices = parseAudioDevices
 PTTWhisper.findFFmpeg       = findFFmpeg
 PTTWhisper.findWhisperBin   = findWhisperBin
 PTTWhisper.resolveModelPath = resolveModelPath
@@ -1627,7 +1745,10 @@ local function startRecording()
   updateMenubar("🔴", "PTT Whisper — Recording...")
 
   -- [OPT1] 組裝 ffmpeg 錄音參數（含可選的聲學濾波器鏈）
-  local recordArgs = { "-y", "-f", "avfoundation", "-i", AUDIO_DEVICE }
+  -- [DEV1] 用設定的裝置名稱解析出索引；解析不到就退回預設並記錄原因
+  local deviceArg, deviceWarn = resolveAudioDevice()
+  if deviceWarn then appendErrorLog("audio device: " .. deviceWarn) end
+  local recordArgs = { "-y", "-f", "avfoundation", "-i", deviceArg }
   if AUDIO_FILTER_CHAIN ~= "" then
     table.insert(recordArgs, "-af")
     table.insert(recordArgs, AUDIO_FILTER_CHAIN)
@@ -1648,6 +1769,8 @@ local function startRecording()
     table.insert(recordArgs, v)
   end
 
+  -- [DEV1] callback 要能標記「是哪一次錄音」出問題
+  local recordSid = sessionCounter
   -- [B4] 先宣告再指派，讓 callback 能引用到 task 自己（用來從 orphan 表移除）
   local thisRecordTask
   thisRecordTask = hs.task.new(ffmpeg, function(exitCode, _, stderr)
@@ -1679,6 +1802,27 @@ local function startRecording()
     if wasOrphan or (not expectedExit) or recSize < MIN_FILE_BYTES then
       appendErrorLog("recording: ffmpeg stderr（尾端 12 行）\n"
                      .. tailLines(stderr, 12))
+    end
+
+    -- [DEV1] 裝置送出壞封包的偵測。
+    --
+    -- 症狀：裝置宣稱 24-bit 卻給不完整的封包，ffmpeg 把每一個都丟掉，
+    -- 檔案停在約 3 秒不再長大，而且它卡在錯誤迴圈裡連訊號都不理。
+    -- 錄音「看起來成功」（有檔案、有秒數），內容卻是垃圾——這是最糟的
+    -- 失敗模式，因為使用者只會看到「沒有文字」而查不出原因。
+    --
+    -- 偵測到就讓裝置快取失效（下次重新解析索引），並標記這個 session，
+    -- 由 afterRecordingSettled 明確報錯，而不是把垃圾送進 whisper。
+    if type(stderr) == "string" and stderr:find("Invalid PCM packet", 1, true) then
+      -- 只留最近幾筆，避免表無限成長（早期的 session 已經不會再被查詢）
+      for k in pairs(deviceErrorSessions) do
+        if k < recordSid - 2 then deviceErrorSessions[k] = nil end
+      end
+      deviceErrorSessions[recordSid] = true
+      appendErrorLog(string.format(
+        "recording: 裝置送出壞封包（Invalid PCM packet）—— 錄音內容不可用，sid=%d",
+        recordSid))
+      invalidateAudioDevice("裝置送出壞封包")
     end
 
     -- [CR11] FFmpeg 收到 SIGINT（正常終止錄音）時在 macOS 回傳 255，
@@ -1743,6 +1887,18 @@ local function stopRecordingAndTranscribe()
   local function afterRecordingSettled(timedOut)
     if sid ~= sessionCounter then return end
     if currentState ~= STATE.TRANSCRIBING then return end
+
+    -- [DEV1] 裝置壞封包：內容不可用，直接以正確原因失敗
+    if deviceErrorSessions[sid] then
+      deviceErrorSessions[sid] = nil
+      abortToIdle("Audio Device Error", {
+        log = string.format(
+          "skipped: 錄音裝置送出壞封包，內容不可用（按住 %.2fs）", duration),
+        alert = "❌ 錄音裝置異常，這次沒有錄到聲音\n請再說一次",
+        alertDur = 4,
+      })
+      return
+    end
 
     local valid, errMsg = isRecordFileValid()
     if not valid then
@@ -2034,13 +2190,20 @@ local function runDiagnostics()
     local ffmpeg = findFFmpeg()
     if not ffmpeg then return "!無法測試（ffmpeg 不存在）" end
     local testFile = PTT_DIR .. "/diag_test.wav"
+    local deviceArg = resolveAudioDevice()
     local output = runCommandSync(ffmpeg,
-      {"-y", "-f", "avfoundation", "-i", AUDIO_DEVICE,
+      {"-y", "-f", "avfoundation", "-i", deviceArg,
        "-ac", "1", "-ar", "16000", "-t", "0.1", testFile},
       {stderr = true})
     local exists = hs.fs.attributes(testFile) ~= nil
     os.remove(testFile)
-    if exists then return "正常" end
+    -- [DEV1] 權限正常但裝置送壞封包，錄出來的東西是垃圾。這是 2026-09-05
+    -- 六次「錄音成功卻沒有文字」的真正原因，必須在這裡就講清楚。
+    if output and output:find("Invalid PCM packet", 1, true) then
+      return "!裝置 " .. deviceArg .. " 送出壞封包（Invalid PCM packet）"
+             .. " —— 錄音內容會是垃圾。請用 audio_device 指定正確的裝置名稱"
+    end
+    if exists then return "正常（" .. deviceArg .. "）" end
     if output and output:find("[Pp]ermission") then
       return "!麥克風權限被拒絕 — 請在 系統設定 → 隱私權 中允許 Hammerspoon"
     end
@@ -2326,7 +2489,9 @@ if menubarItem then
       { title = "-" },
       { title = "狀態：" .. currentState, disabled = true },
       { title = "Session：#" .. sessionCounter, disabled = true },
-      { title = "裝置：" .. AUDIO_DEVICE, disabled = true },
+      { title = "裝置：" .. (AUDIO_DEVICE_NAME ~= ""
+          and (AUDIO_DEVICE_NAME .. " " .. (cachedAudioDeviceArg or "(未解析)"))
+          or AUDIO_DEVICE), disabled = true },
       { title = "熱鍵：" .. hotkeyLabel, disabled = true },
       { title = "快取：" .. (CACHE_ENABLED and "ON" or "OFF"), disabled = true },
       { title = "Fallback：" .. (FALLBACK_MODEL ~= "" and FALLBACK_MODEL or "無"),

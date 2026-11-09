@@ -211,6 +211,7 @@ Hammerspoon Console → hs.reload()
   "cache_enabled": false,
   "fallback_model": "ggml-tiny.bin",
 
+  "audio_device": "Studio Display XDR麥克風",
   "audio_filter_chain": "highpass=f=200,lowpass=f=5000",
   "audio_normalize": true,
 
@@ -239,6 +240,7 @@ Hammerspoon Console → hs.reload()
 | `show_preview_alert` | bool | `true` | 轉錄完成時是否顯示預覽 alert |
 | `cache_enabled` | bool | `false` | 啟用轉錄結果快取 |
 | `fallback_model` | string | `""` | Fallback 模型檔名或完整路徑 |
+| `audio_device` | string | `""` | 錄音裝置**名稱**（如 `"Studio Display XDR麥克風"`）。`""` = 用第一個裝置。**強烈建議指定**，見下方 |
 | `audio_filter_chain` | string | 見下方 | 錄音時的 FFmpeg `-af` 濾波器鏈，設為 `""` 停用。**只放即時濾波器**，見下方 |
 | `audio_normalize` | bool | `true` | 錄音後的響度正規化（EBU R128），由 `transcribe.sh` 執行 |
 | `initial_prompt` | string | `""` | 全域術語表（見「術語注入」）|
@@ -248,6 +250,32 @@ Hammerspoon Console → hs.reload()
 | `server_mode` | bool | `false` | 啟用常駐 whisper-server（見「常駐 Server 模式」）|
 | `server_port` | number | `8178` | Server 監聽埠，有效 1024~65535 |
 | `lang_models` | object | `{}` | 依 App Bundle ID 切換語言/模型/prompt。**主要講中文請明確設 `"lang": "zh"`，不要用 `"auto"`** |
+
+#### 為什麼該指定 `audio_device`
+
+不指定的話會用 AVFoundation 的**第一個**裝置（`:0`）——那是「第幾個」，
+**不是「哪一個」**。裝置清單會隨插拔重排：
+
+```
+[0] Studio Display XDR麥克風
+[1] iPhone16麥克風              ← Continuity 連上時出現
+[2] Microsoft Teams Audio       ← Teams 載入虛擬裝置時出現
+```
+
+索引一重排，`:0` 就指到別的東西。真機實測（2026-09-05，六次）的後果：
+
+```
+[pcm_s24le] Invalid PCM packet, data has size 2 but at least a size of 3 was expected
+[dec:pcm_s24le] Decoding error: Invalid data found when processing input
+```
+
+裝置宣稱 24-bit（每取樣 3 bytes）卻只給 2 bytes，ffmpeg **把每一個封包都
+丟掉**：檔案停在約 3 秒不再長大，而且它卡在錯誤迴圈裡連 SIGINT/SIGTERM 都
+不理，最後只能 SIGKILL。使用者看到的是**「錄音成功但沒有文字」**——最難查的
+一種失敗。
+
+用 `ffmpeg -f avfoundation -list_devices true -i ""` 看你的裝置名稱。
+名稱在啟動時解析成索引並快取；偵測到壞封包會自動失效重算。
 
 `audio_filter_chain` 預設值為 `highpass=f=200,lowpass=f=5000`：
 
@@ -627,7 +655,7 @@ rm -rf ~/.ptt-whisper/cache/
 詳見 [CHANGELOG.md](CHANGELOG.md)
 
 **當前版本：**
-- `ptt_whisper.lua` v4.1.3
+- `ptt_whisper.lua` v4.2.0
 - `transcribe.sh` v2.10.2
 
 ---
