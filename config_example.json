@@ -8,6 +8,7 @@
   "cache_enabled": false,
   "fallback_model": "ggml-tiny.bin",
 
+  "audio_device": "Studio Display XDR麥克風",
   "audio_filter_chain": "highpass=f=200,lowpass=f=5000",
   "audio_normalize": true,
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================
-# transcribe.sh v2.12.0 — PTT Whisper 轉錄腳本
+# transcribe.sh v2.13.0 — PTT Whisper 轉錄腳本
 #
-# 搭配 ptt_whisper.lua v4.1.2 使用
+# 搭配 ptt_whisper.lua v4.1.3 使用
 # 用法：transcribe.sh /path/to/audio.wav [language] [model_path]
 #   language   — 覆寫 WHISPER_LANG（如 en, zh, ja）
 #                空字串 "" 或 "auto" = 不帶 -l，讓 whisper.cpp 自行偵測
@@ -11,6 +11,12 @@
 #                空字串 "" = 使用預設
 #   prompt     — 覆寫 WHISPER_PROMPT（initial prompt，注入術語/人名）
 # 輸出：轉錄文字寫到 stdout（單行，去頭尾空白，含 trailing newline）
+#
+# v2.13.0（中文標點）：
+#  PU1.[Feat] 中文語境的逗號／問號／驚嘆號／分號／冒號轉全形。
+#             whisper 的輸出有固定偏差：句號給全形「。」，逗號與問號給半形。
+#             規則刻意保守——只有前一個字是漢字才轉，天然保護版本號、時間、
+#             識別碼與英文句子。半形句點一律不碰。轉換失敗一律保留原文。
 #
 # v2.12.0（code review 修正）：
 #  N5.[Fix]  快取身分改用「實際做成了正規化」而非「要求做正規化」。
@@ -963,6 +969,81 @@ fi
 if [[ -n "$result" ]]; then
   stripped=$(echo "$result" | sed -E 's/[[:punct:][:space:]]//g')
   [[ -z "$stripped" ]] && result=""
+fi
+
+# ── [PU1] 中文語境的標點轉全形 ────────────────────────────────
+# whisper 的輸出有個固定偏差：句號給全形「。」，但逗號和問號給半形。
+# 實測 39 個快取檔（954 字）：半形 41 個（','×21、'?'×20），全形 22 個
+# （全部是「。」），一個半形句點都沒有。中文行文夾 ASCII 標點是排版錯誤，
+# 而且它影響每一句話，不像術語只影響偶爾提到的幾個詞。
+#
+# 規則：**前後都必須是漢字**（句末標點放寬為「後面是漢字或字串結尾」）。
+# 語料裡的形態：
+#   ','  前後都是漢字        ×21  → 全部該轉
+#   '?'  前面是漢字          ×19  → 全部該轉
+#   '?'  前面是 'r'（英文句） ×1   → 不能轉
+#
+# [PU2] 初版只檢查「前一個字是漢字」，第三方 review 指出那是**看文字系統、
+# 不是看語言脈絡**，實測會改壞中英混雜的內容：
+#     SELECT 姓名, age FROM users  →  SELECT 姓名， age FROM users
+#     Set 值: then continue        →  Set 值： then continue
+#     SELECT 值;                   →  SELECT 值；
+# 逗號前面確實是漢字「名」，但那個逗號屬於 ASCII 語法，不是中文標點。
+# 改成「前後都要漢字」之後這三個都不再被動到，而語料裡 40 個該轉的仍全中。
+#
+# 句末的 '?' '!' 另外處理：句子結尾後面沒有字，不能要求後面是漢字。
+# 但 ',' ';' ':' **不放寬到結尾**——中文散文不會用逗號結尾，出現在結尾的
+# 逗號分號比較可能是程式碼（「SELECT 值;」正是這樣被擋下來的）。
+#
+# 這條規則天然保護了「4.1.2」「12:30」「HT-H7608」這類數字與識別碼。
+#
+# 不處理 '.'：它與小數點、版本號、縮寫難以區分，而 whisper 本來就輸出
+# 全形「。」——資料裡半形句點出現 0 次，改它是徒增風險沒有收益。
+#
+# 「vLLM, 效果不錯」這種前面是英文的逗號不會被轉。中文排版上它其實該轉，
+# 但資料裡 0 次，為此放寬規則不值得。日後真的遇到再說。
+#
+# [PU2] **本規則只涵蓋中文，不涵蓋日文與韓文。** \p{Han} 不含假名，所以
+# 「これは?」不會被轉。這是刻意的：日文的逗號是「、」(U+3001) 而不是
+# 「，」(U+FF0C)，把這條規則放寬到假名反而會產生排版錯誤的日文。
+# 日後若要支援日文，需要另一套對應表，那是獨立的功能而不是放寬判別式。
+#
+# 用 perl 是因為 LC_ALL=C 下 sed 處理多位元組不可靠，而 perl 的 Unicode
+# script 屬性直接表達了「漢字」這個意圖，比手刻 UTF-8 位元組範圍好審閱得多。
+#
+# [PU2] 必須用 \p{Script=Han} 而不是 \p{Han}：後者預設是 Script_Extensions，
+# 會把「。」「、」這類**漢字圈共用標點**也算成 Han。實測
+#     好。,壞  →  好。，壞     （\p{Han}，錯：句號後面的逗號被當成中文語境）
+#     好。,壞  →  好。,壞      （\p{Script=Han}，正確）
+# 這一點連第三方 review 都判斷錯了（它的探測輸出其實顯示有轉，卻結論為
+# 「不會誤觸發」）——所以下面有一條斷言專門釘住它。
+# /usr/bin/perl 是 macOS 內建，但仍照本專案慣例做成**失敗即跳過**，
+# 不讓它變成硬依賴。
+if [[ -n "$result" ]]; then
+  PERL_BIN=""
+  for pcand in /usr/bin/perl /opt/homebrew/bin/perl /usr/local/bin/perl; do
+    [[ -x "$pcand" ]] && { PERL_BIN="$pcand"; break; }
+  done
+  [[ -z "$PERL_BIN" ]] && PERL_BIN=$(command -v perl 2>/dev/null || true)
+
+  if [[ -n "$PERL_BIN" ]]; then
+    punct_out=$(printf '%s' "$result" | "$PERL_BIN" -CSD -pe '
+      BEGIN { %m = ( ","=>"\x{FF0C}", "?"=>"\x{FF1F}", "!"=>"\x{FF01}",
+                     ";"=>"\x{FF1B}", ":"=>"\x{FF1A}" ); }
+      s/(?<=\p{Script=Han})([,;:])(?=\p{Script=Han})/$m{$1}/g;
+      s/(?<=\p{Script=Han})([?!])(?=\p{Script=Han}|\s*$)/$m{$1}/g;' 2>/dev/null) || punct_out=""
+    if [[ -n "$punct_out" ]]; then
+      if [[ "$punct_out" != "$result" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: punctuation normalized to full-width" >> "$LOG_FILE"
+      fi
+      result="$punct_out"
+    else
+      # 轉換失敗絕不能吃掉文字——保留原本的 result
+      echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: punctuation normalize failed, keeping original" >> "$LOG_FILE"
+    fi
+  else
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] WARN: punctuation normalize skipped, perl not found" >> "$LOG_FILE"
+  fi
 fi
 
 # ── [F4][BK1] 寫入快取：一律用「實際完成推理的 backend」 ──────

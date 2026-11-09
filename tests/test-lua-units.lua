@@ -301,5 +301,69 @@ check("ffmpeg 形態：保留結尾的錯誤",
 check("ffmpeg 形態：丟掉開頭的版本橫幅",
       tail:find("ffmpeg version", 1, true) == nil, true)
 
+-- ── [DEV1] parseAudioDevices ────────────────────────────────
+local parseAudioDevices = load(
+  extract(readAll(srcPath), "parseAudioDevices") .. "\nreturn parseAudioDevices\n",
+  "parseAudioDevices")()
+
+-- 真機（2026-09-06）的實際輸出。重點：**視訊裝置排在前面，而且用完全
+-- 相同的 `[N] 名稱` 格式**。不照「AVFoundation audio devices:」分段的話，
+-- 相機會被當成麥克風，索引就整組錯掉——那正是這個函式存在的理由。
+local REAL_OUTPUT = [[
+ffmpeg version 8.1 Copyright (c) 2000-2026 the FFmpeg developers
+  libavutil      60. 26.100 / 60. 26.100
+[AVFoundation indev @ 0x984c20140] AVFoundation video devices:
+[AVFoundation indev @ 0x984c20140] [0] Studio Display XDR相機
+[AVFoundation indev @ 0x984c20140] [1] iPhone16桌上視角相機
+[AVFoundation indev @ 0x984c20140] [2] Studio Display XDR桌上視角相機
+[AVFoundation indev @ 0x984c20140] [3] iPhone16相機
+[AVFoundation indev @ 0x984c20140] [4] Capture screen 0
+[AVFoundation indev @ 0x984c20140] AVFoundation audio devices:
+[AVFoundation indev @ 0x984c20140] [0] Studio Display XDR麥克風
+[AVFoundation indev @ 0x984c20140] [1] iPhone16麥克風
+[AVFoundation indev @ 0x984c20140] [2] Microsoft Teams Audio
+]]
+
+local d = parseAudioDevices(REAL_OUTPUT)
+check("解析出 Studio Display 麥克風", d["0"], "Studio Display XDR麥克風")
+check("解析出 iPhone 麥克風",        d["1"], "iPhone16麥克風")
+check("解析出 Teams 虛擬裝置",       d["2"], "Microsoft Teams Audio")
+
+-- 這是整個函式的重點：相機絕對不能混進來。
+-- 注意 d["0"] ~= 相機 這種寫法沒有鑑別力——視訊的 [0] 會被音訊的 [0] 蓋掉，
+-- 就算完全不分段也會通過。要斷言的是「整份結果裡沒有任何相機」。
+local hasCamera = false
+for _, name in pairs(d) do
+  if name:find("相機") or name:find("Capture screen") then hasCamera = true end
+end
+check("結果裡沒有任何視訊裝置", hasCamera, false)
+local n = 0; for _ in pairs(d) do n = n + 1 end
+check("只有 3 個音訊裝置（不是視訊的 5 個）", n, 3)
+
+-- 只有視訊、沒有音訊區段時不能誤判
+local VIDEO_ONLY = [[
+[AVFoundation indev @ 0x1] AVFoundation video devices:
+[AVFoundation indev @ 0x1] [0] FaceTime HD Camera
+]]
+local v = parseAudioDevices(VIDEO_ONLY)
+local vn = 0; for _ in pairs(v) do vn = vn + 1 end
+check("只有視訊裝置 → 解析出 0 個音訊裝置", vn, 0)
+
+-- 邊界
+local e1 = 0; for _ in pairs(parseAudioDevices(nil)) do e1 = e1 + 1 end
+check("nil → 空表", e1, 0)
+local e2 = 0; for _ in pairs(parseAudioDevices("")) do e2 = e2 + 1 end
+check("空字串 → 空表", e2, 0)
+local e3 = 0; for _ in pairs(parseAudioDevices(12345)) do e3 = e3 + 1 end
+check("非字串 → 空表", e3, 0)
+
+-- 裝置名稱含空白與括號（外接介面常見）
+local WEIRD = [[
+[AVFoundation indev @ 0x1] AVFoundation audio devices:
+[AVFoundation indev @ 0x1] [0] Scarlett 2i2 USB (2 in, 2 out)
+]]
+check("裝置名稱含空白與括號時完整保留",
+      parseAudioDevices(WEIRD)["0"], "Scarlett 2i2 USB (2 in, 2 out)")
+
 print(string.format("-- lua units: %d passed, %d failed", pass, fail))
 os.exit(fail == 0 and 0 or 1)
